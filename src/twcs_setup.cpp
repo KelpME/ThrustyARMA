@@ -429,56 +429,95 @@ void capture_axes(CaptureState& state) {
 
 void capture_buttons(CaptureState& state) {
     std::cout << "\n=== Phase 2: Button Capture ===\n";
-    std::cout << "Press up to 11 different buttons (10 seconds timeout)\n";
-    std::cout << "Buttons will be mapped in order to: ";
+    std::cout << "Buttons will be captured one at a time in the following order:\n";
     for (size_t i = 0; i < BUTTON_NAMES.size(); i++) {
-        if (i > 0) std::cout << ", ";
-        std::cout << BUTTON_NAMES[i];
+        std::cout << "  " << (i + 1) << ". " << BUTTON_NAMES[i] << "\n";
     }
-    std::cout << "\n";
-    std::cout << "Starting in 3... ";
-    std::cout.flush();
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    std::cout << "2... ";
-    std::cout.flush();
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    std::cout << "1... ";
-    std::cout.flush();
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    std::cout << "GO!\n";
+    std::cout << "\nControls: 's' to skip current button, 'r' to restart Phase 2, ENTER to accept detected button\n\n";
     
-    auto start = std::chrono::steady_clock::now();
-    std::set<std::pair<std::string, int>> captured_set;
+    state.captured_buttons.clear();
     
-    while (state.captured_buttons.size() < VIRTUAL_BUTTONS.size() && 
-           std::chrono::steady_clock::now() - start < std::chrono::seconds(10)) {
+    for (size_t i = 0; i < VIRTUAL_BUTTONS.size(); i++) {
+        bool restart_phase = false;
+        std::string captured_device;
+        int captured_code = 0;
+        bool has_detection = false;
         
-        for (auto& device : state.devices) {
-            struct input_event ev;
-            int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        while (true) {
+            if (!has_detection) {
+                std::cout << "Press button for: " << BUTTON_NAMES[i] << " (" << VIRTUAL_BUTTONS[i] << ")\n";
+                std::cout << "Waiting for input... ";
+                std::cout.flush();
+            }
             
-            if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_KEY && ev.value == 1) {
-                std::pair<std::string, int> button_id = {device.role, ev.code};
+            set_nonblocking(true);
+            
+            while (true) {
+                // Check for keyboard controls
+                char c = get_key_with_timeout(0);
+                if (c == 's' || c == 'S') {
+                    std::cout << "SKIPPED\n";
+                    set_nonblocking(false);
+                    has_detection = false;
+                    break;
+                } else if (c == 'r' || c == 'R') {
+                    std::cout << "RESTARTING\n";
+                    set_nonblocking(false);
+                    restart_phase = true;
+                    has_detection = false;
+                    break;
+                } else if (c == '\r' || c == '\n') {
+                    if (has_detection) {
+                        std::cout << "ACCEPTED\n";
+                        state.captured_buttons.push_back({captured_device, captured_code});
+                        set_nonblocking(false);
+                        goto next_button;
+                    }
+                }
                 
-                if (captured_set.find(button_id) == captured_set.end()) {
-                    captured_set.insert(button_id);
-                    state.captured_buttons.push_back(button_id);
+                // Listen to all devices for button press
+                for (auto& device : state.devices) {
+                    struct input_event ev;
+                    int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
                     
-                    int btn_index = state.captured_buttons.size() - 1;
-                    std::cout << "Button " << (btn_index + 1) << " (" << BUTTON_NAMES[btn_index] 
-                             << "): " << device.role << " code " << ev.code << "\n";
-                    
-                    if (state.captured_buttons.size() >= VIRTUAL_BUTTONS.size()) {
+                    if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_KEY && ev.value == 1) {
+                        // Clear the "Waiting for input..." line
+                        std::cout << "\r" << std::string(50, ' ') << "\r";
+                        std::cout << "Detected: " << device.role << " " << ev.code << "\n";
+                        std::cout << "Press ENTER to accept, or press another button to override\n";
+                        std::cout.flush();
+                        
+                        captured_device = device.role;
+                        captured_code = ev.code;
+                        has_detection = true;
                         break;
                     }
                 }
+                
+                if (restart_phase || has_detection) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            
+            set_nonblocking(false);
+            
+            if (restart_phase) {
+                state.captured_buttons.clear();
+                i = -1; // Will increment to 0 in outer loop
+                break;
+            }
+            
+            if (!has_detection) {
+                break; // Skipped, move to next button
             }
         }
         
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        next_button:
+        if (restart_phase) {
+            continue; // Restart the outer loop
+        }
     }
     
-    std::cout << "Captured " << state.captured_buttons.size() << " buttons\n";
+    std::cout << "\nCaptured " << state.captured_buttons.size() << " out of " << VIRTUAL_BUTTONS.size() << " buttons\n";
 }
 
 bool write_config(const CaptureState& state) {
