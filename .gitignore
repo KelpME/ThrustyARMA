@@ -1,0 +1,69 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# Compiled binaries
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+
+# Libraries
+*.a
+*.so
+*.so.*
+*.dylib
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# IDE files
+.vscode/
+.idea/
+*.vcxproj*
+*.sln
+*.user
+
+# Temporary files
+*.tmp
+*.temp
+*~
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Generated documentation
+docs/generated/
+
+# Test outputs
+test_results/
+coverage/
+
+# Local configuration (but keep template)
+# config.json
+.env
+
+# Editor backup files
+*.bak
+*.swp
+*.swo
+
+# Package files
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+
+# Local installation overrides
+.local/
+.user.*

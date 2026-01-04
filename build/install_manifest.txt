@@ -1,2 +1,0 @@
-/home/tmo/.local/bin/twcs_select
-/home/tmo/.local/bin/twcs_mapper

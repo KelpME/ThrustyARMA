@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/twcs_select.dir/link.d CMakeFiles/twcs_select.dir/src/twcs_select.cpp.o -o twcs_select  libconfig_lib.a
