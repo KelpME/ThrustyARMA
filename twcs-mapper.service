@@ -1,0 +1,17 @@
+[Unit]
+Description=TWCS ARMA Mapper
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/%u/.local/bin/twcs_mapper
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=%i
+Environment=XAUTHORITY=%h/.Xauthority
+
+# Remove this line if you don't want device grabbing
+# Environment=TWCS_GRAB=1
+
+[Install]
+WantedBy=graphical-session.target

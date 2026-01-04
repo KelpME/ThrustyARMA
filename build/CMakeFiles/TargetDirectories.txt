@@ -1,0 +1,9 @@
+/home/tmo/Work/ThrustyARMA/build/CMakeFiles/config_lib.dir
+/home/tmo/Work/ThrustyARMA/build/CMakeFiles/twcs_select.dir
+/home/tmo/Work/ThrustyARMA/build/CMakeFiles/twcs_mapper.dir
+/home/tmo/Work/ThrustyARMA/build/CMakeFiles/edit_cache.dir
+/home/tmo/Work/ThrustyARMA/build/CMakeFiles/rebuild_cache.dir
+/home/tmo/Work/ThrustyARMA/build/CMakeFiles/list_install_components.dir
+/home/tmo/Work/ThrustyARMA/build/CMakeFiles/install.dir
+/home/tmo/Work/ThrustyARMA/build/CMakeFiles/install/local.dir
+/home/tmo/Work/ThrustyARMA/build/CMakeFiles/install/strip.dir

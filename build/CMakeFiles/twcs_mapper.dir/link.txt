@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/twcs_mapper.dir/link.d CMakeFiles/twcs_mapper.dir/src/twcs_mapper.cpp.o -o twcs_mapper  libconfig_lib.a -levdev
