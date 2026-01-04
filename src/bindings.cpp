@@ -2,6 +2,7 @@
 #include "config.hpp"
 #include <algorithm>
 #include <unordered_set>
+#include <set>
 
 #ifdef DEBUG_BINDINGS
 bool debug_bindings_enabled = false;
@@ -99,19 +100,45 @@ void BindingResolver::process_input(const PhysicalInput& input, int value) {
 
 std::vector<std::pair<VirtualSlot, int>> BindingResolver::get_pending_events() {
     std::vector<std::pair<VirtualSlot, int>> events;
+    std::set<VirtualSlot> emitted_slots; // Track to prevent duplicates
     
     for (const auto& [slot, refcount] : button_refcounts) {
+        // Safety: Skip invalid slots
+        if (!is_virtual_slot_valid(slot)) {
+            DEBUG_LOG("Skipping invalid button slot: kind=%d code=%d\n", static_cast<int>(slot.kind), slot.code);
+            continue;
+        }
+        
+        // Safety: Skip duplicate slots
+        if (emitted_slots.count(slot)) {
+            DEBUG_LOG("Skipping duplicate button slot: kind=%d code=%d\n", static_cast<int>(slot.kind), slot.code);
+            continue;
+        }
+        
         int last_value = last_output_values.count(slot) ? last_output_values[slot] : 0;
         int current_value = (refcount > 0) ? 1 : 0;
         
         if (last_value != current_value) {
             events.push_back({slot, current_value});
             last_output_values[slot] = current_value;
+            emitted_slots.insert(slot);
             DEBUG_LOG("Button event: slot=%d value=%d\n", slot.code, current_value);
         }
     }
     
     for (const auto& [slot, role_values] : axis_values) {
+        // Safety: Skip invalid slots
+        if (!is_virtual_slot_valid(slot)) {
+            DEBUG_LOG("Skipping invalid axis slot: kind=%d code=%d\n", static_cast<int>(slot.kind), slot.code);
+            continue;
+        }
+        
+        // Safety: Skip duplicate slots
+        if (emitted_slots.count(slot)) {
+            DEBUG_LOG("Skipping duplicate axis slot: kind=%d code=%d\n", static_cast<int>(slot.kind), slot.code);
+            continue;
+        }
+        
         Role selected_role = Role::Stick;
         bool has_value = false;
         
@@ -133,6 +160,7 @@ std::vector<std::pair<VirtualSlot, int>> BindingResolver::get_pending_events() {
         if (last_value != current_value) {
             events.push_back({slot, current_value});
             last_output_values[slot] = current_value;
+            emitted_slots.insert(slot);
             DEBUG_LOG("Axis event: slot=%d value=%d (role=%d)\n", slot.code, current_value, static_cast<int>(selected_role));
         }
     }
