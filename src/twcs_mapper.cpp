@@ -35,6 +35,14 @@ struct InputDevice {
     int fd;
     struct libevdev* dev;
     std::string path;
+    std::string by_id_path;
+    std::string vendor;
+    std::string product;
+    bool optional;
+    bool online;
+    int consecutive_read_failures;
+    std::chrono::steady_clock::time_point last_reconnect_attempt;
+    int reconnect_backoff_ms;
 };
 
 Role string_to_role(const std::string& role_str) {
@@ -73,6 +81,160 @@ bool validate_device(const std::string& device_path, const std::string& expected
     std::string product_id = get_udev_property(device_path, "ID_MODEL_ID");
     
     return (vendor_id == expected_vendor && product_id == expected_product);
+}
+
+bool reopen_device(InputDevice& device) {
+    // Close existing fd if open
+    if (device.fd >= 0) {
+        if (device.dev) {
+            libevdev_free(device.dev);
+            device.dev = nullptr;
+        }
+        close(device.fd);
+        device.fd = -1;
+    }
+    
+    // Try to resolve the by-id path
+    char real_path[PATH_MAX];
+    if (realpath(device.by_id_path.c_str(), real_path) == nullptr) {
+        return false;
+    }
+    
+    // Try to open the device
+    int fd = open(real_path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        return false;
+    }
+    
+    // Initialize libevdev
+    struct libevdev* dev = nullptr;
+    int rc = libevdev_new_from_fd(fd, &dev);
+    if (rc < 0) {
+        close(fd);
+        return false;
+    }
+    
+    // Validate device
+    if (!validate_device(real_path, device.vendor, device.product)) {
+        libevdev_free(dev);
+        close(fd);
+        return false;
+    }
+    
+    // Update device state
+    device.fd = fd;
+    device.dev = dev;
+    device.path = real_path;
+    device.online = true;
+    device.consecutive_read_failures = 0;
+    device.reconnect_backoff_ms = 500; // Reset to initial backoff
+    
+    std::cout << "Successfully reconnected " << device.role << ": " << real_path << "\n";
+    return true;
+}
+
+void handle_device_error(InputDevice& device) {
+    device.consecutive_read_failures++;
+    
+    // Mark offline if we get specific errors or repeated failures
+    if (errno == ENODEV || errno == EIO || device.consecutive_read_failures >= 3) {
+        if (device.online) {
+            std::cout << device.role << " device disconnected (errno=" << errno 
+                      << ", failures=" << device.consecutive_read_failures << ")\n";
+            device.online = false;
+        }
+        
+        // Close the device
+        if (device.dev) {
+            libevdev_free(device.dev);
+            device.dev = nullptr;
+        }
+        if (device.fd >= 0) {
+            close(device.fd);
+            device.fd = -1;
+        }
+    }
+}
+
+void attempt_device_reconnection(InputDevice& device) {
+    if (device.online || device.optional) {
+        return;
+    }
+    
+    auto now = std::chrono::steady_clock::now();
+    auto time_since_attempt = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - device.last_reconnect_attempt).count();
+    
+    if (time_since_attempt >= device.reconnect_backoff_ms) {
+        device.last_reconnect_attempt = now;
+        
+        if (reopen_device(device)) {
+            // Successfully reconnected
+            device.reconnect_backoff_ms = 500; // Reset backoff
+        } else {
+            // Failed to reconnect, increase backoff (max 2 seconds)
+            device.reconnect_backoff_ms = std::min(2000, device.reconnect_backoff_ms * 2);
+        }
+    }
+}
+
+bool device_supports_code(const InputDevice& device, SrcKind kind, uint16_t code) {
+    if (!device.dev) return false;
+    
+    if (kind == SrcKind::Key) {
+        return libevdev_has_event_code(device.dev, EV_KEY, code);
+    } else {
+        return libevdev_has_event_code(device.dev, EV_ABS, code);
+    }
+}
+
+void validate_and_filter_bindings(std::vector<Binding>& bindings, const std::vector<InputDevice>& devices) {
+    std::set<std::tuple<std::string, SrcKind, uint16_t>> logged_missing_codes;
+    
+    for (auto it = bindings.begin(); it != bindings.end();) {
+        bool binding_valid = true;
+        
+        // Find the source device for this binding
+        const InputDevice* source_device = nullptr;
+        for (const auto& device : devices) {
+            if (device.role == (it->src.role == Role::Stick ? "stick" : 
+                               it->src.role == Role::Throttle ? "throttle" : "rudder")) {
+                source_device = &device;
+                break;
+            }
+        }
+        
+        if (source_device && source_device->dev) {
+            // Check if device supports the source code
+            if (!device_supports_code(*source_device, it->src.kind, it->src.code)) {
+                auto missing_key = std::make_tuple(source_device->role, it->src.kind, it->src.code);
+                
+                // Log warning once per missing code
+                if (logged_missing_codes.find(missing_key) == logged_missing_codes.end()) {
+                    const char* type_name = (it->src.kind == SrcKind::Key) ? "KEY" : "ABS";
+                    const char* code_name = libevdev_event_code_get_name(
+                        it->src.kind == SrcKind::Key ? EV_KEY : EV_ABS, it->src.code);
+                    
+                    std::cout << "WARNING: " << source_device->role << " device does not support " 
+                              << type_name << " " << (code_name ? code_name : "UNKNOWN") 
+                              << " (" << it->src.code << "). Skipping binding.\n";
+                    
+                    logged_missing_codes.insert(missing_key);
+                }
+                
+                binding_valid = false;
+            }
+        } else {
+            // Device not available - skip binding but don't log (device validation handles this)
+            binding_valid = false;
+        }
+        
+        if (!binding_valid) {
+            it = bindings.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 int discovery_mode(const Config& config) {
@@ -117,6 +279,14 @@ int discovery_mode(const Config& config) {
         device.fd = fd;
         device.dev = dev;
         device.path = real_path;
+        device.by_id_path = input_config.by_id;
+        device.vendor = input_config.vendor;
+        device.product = input_config.product;
+        device.optional = input_config.optional;
+        device.online = true;
+        device.consecutive_read_failures = 0;
+        device.reconnect_backoff_ms = 500;
+        device.last_reconnect_attempt = std::chrono::steady_clock::now();
         devices.push_back(device);
         
         std::cout << "\n=== " << input_config.role << " Discovery ===\n";
@@ -264,6 +434,24 @@ int diagnostics_mode(const Config& config) {
                 valid_config_bindings.push_back(binding);
             }
         }
+        
+        // Create temporary devices for validation (without opening them)
+        std::vector<InputDevice> temp_devices;
+        for (const auto& input_config : config.inputs) {
+            InputDevice device;
+            device.role = input_config.role;
+            device.by_id_path = input_config.by_id;
+            device.vendor = input_config.vendor;
+            device.product = input_config.product;
+            device.optional = input_config.optional;
+            device.online = false;
+            device.fd = -1;
+            device.dev = nullptr;
+            temp_devices.push_back(device);
+        }
+        
+        // Validate source codes and filter bindings
+        validate_and_filter_bindings(valid_config_bindings, temp_devices);
         
         if (!valid_config_bindings.empty()) {
             bindings = valid_config_bindings;
@@ -548,6 +736,14 @@ int main(int argc, char* argv[]) {
         device.fd = fd;
         device.dev = dev;
         device.path = real_path;
+        device.by_id_path = input_config.by_id;
+        device.vendor = input_config.vendor;
+        device.product = input_config.product;
+        device.optional = input_config.optional;
+        device.online = true;
+        device.consecutive_read_failures = 0;
+        device.reconnect_backoff_ms = 500;
+        device.last_reconnect_attempt = std::chrono::steady_clock::now();
         input_devices.push_back(device);
     }
 
@@ -720,6 +916,9 @@ int main(int argc, char* argv[]) {
         std::cout << "Loaded " << bindings.size() << " default bindings\n";
     }
     
+    // Validate source codes and filter out invalid bindings
+    validate_and_filter_bindings(bindings, input_devices);
+    
     BindingResolver resolver(bindings);
     
 #ifdef DEBUG_BINDINGS
@@ -758,10 +957,17 @@ int main(int argc, char* argv[]) {
             
             if (!source_device) continue;
             
+            // Skip offline devices
+            if (!source_device->online || source_device->fd < 0 || !source_device->dev) {
+                continue;
+            }
+            
             struct input_event ev;
             int rc = libevdev_next_event(source_device->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
             
             if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
+                // Reset failure counter on successful read
+                source_device->consecutive_read_failures = 0;
                 events_written = false;
                 
                 switch (ev.type) {
@@ -818,6 +1024,8 @@ int main(int argc, char* argv[]) {
                 
                 // Emit any pending virtual events
                 auto pending_events = resolver.get_pending_events();
+                bool events_emitted = false;
+                
                 for (const auto& [slot, value] : pending_events) {
                     struct input_event out_ev;
                     memset(&out_ev, 0, sizeof(out_ev));
@@ -826,14 +1034,14 @@ int main(int argc, char* argv[]) {
                     out_ev.value = value;
                     
                     if (write(uinput_fd, &out_ev, sizeof(out_ev)) >= 0) {
-                        events_written = true;
+                        events_emitted = true;
                     }
                 }
                 
                 resolver.clear_pending_events();
                 
-                // Emit sync if we wrote events
-                if (events_written) {
+                // Emit sync only if we actually emitted events (safety check)
+                if (events_emitted) {
                     struct input_event sync_ev;
                     memset(&sync_ev, 0, sizeof(sync_ev));
                     sync_ev.type = EV_SYN;
@@ -841,7 +1049,29 @@ int main(int argc, char* argv[]) {
                     sync_ev.value = 0;
                     
                     write(uinput_fd, &sync_ev, sizeof(sync_ev));
-                    events_written = false;
+                }
+            } else if (rc == -EAGAIN) {
+                // No data available, reset failure counter
+                source_device->consecutive_read_failures = 0;
+            } else {
+                // Read error - handle device disconnection
+                handle_device_error(*source_device);
+            }
+        }
+        
+        // Try to reconnect any offline devices
+        for (auto& device : input_devices) {
+            attempt_device_reconnection(device);
+            
+            // If device came back online, add it to epoll
+            if (device.online && device.fd >= 0) {
+                struct epoll_event event;
+                event.events = EPOLLIN;
+                event.data.fd = device.fd;
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, device.fd, &event) < 0) {
+                    if (errno != EEXIST) { // EEXIST means already added
+                        perror("Failed to add reconnected device to epoll");
+                    }
                 }
             }
         }
