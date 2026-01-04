@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Find required packages
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(EVDEV REQUIRED libevdev)
+pkg_check_modules(NCURSES REQUIRED ncursesw)
 
 # Create library for config handling
 add_library(config_lib STATIC
@@ -38,10 +39,30 @@ target_include_directories(twcs_mapper PRIVATE ${EVDEV_INCLUDE_DIRS})
 target_compile_options(twcs_mapper PRIVATE ${EVDEV_CFLAGS_OTHER})
 target_compile_definitions(twcs_mapper PRIVATE _GNU_SOURCE)
 
+# Create twcs_config executable
+add_executable(twcs_config
+    src/twcs_config.cpp
+)
+
+target_link_libraries(twcs_config config_lib ${EVDEV_LIBRARIES} ${NCURSES_LIBRARIES})
+target_include_directories(twcs_config PRIVATE ${EVDEV_INCLUDE_DIRS} ${NCURSES_INCLUDE_DIRS})
+target_compile_options(twcs_config PRIVATE ${EVDEV_CFLAGS_OTHER} ${NCURSES_CFLAGS_OTHER})
+target_compile_definitions(twcs_config PRIVATE _GNU_SOURCE)
+
+# Create twcs_setup executable
+add_executable(twcs_setup
+    src/twcs_setup.cpp
+)
+
+target_link_libraries(twcs_setup config_lib ${EVDEV_LIBRARIES})
+target_include_directories(twcs_setup PRIVATE ${EVDEV_INCLUDE_DIRS})
+target_compile_options(twcs_setup PRIVATE ${EVDEV_CFLAGS_OTHER})
+target_compile_definitions(twcs_setup PRIVATE _GNU_SOURCE)
+
 # Install targets
 include(GNUInstallDirs)
 
-install(TARGETS twcs_select twcs_mapper
+install(TARGETS twcs_select twcs_mapper twcs_config twcs_setup
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 

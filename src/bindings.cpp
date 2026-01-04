@@ -58,9 +58,9 @@ BindingResolver::BindingResolver(const std::vector<Binding>& bindings) : binding
         if (binding.dst.kind == SrcKind::Key) {
             button_refcounts[binding.dst] = 0;
         } else {
-            axis_values[binding.dst][Role::Stick] = 0;
-            axis_values[binding.dst][Role::Throttle] = 0;
-            axis_values[binding.dst][Role::Rudder] = 0;
+            axis_values[binding.dst][Role::Stick] = std::nullopt;
+            axis_values[binding.dst][Role::Throttle] = std::nullopt;
+            axis_values[binding.dst][Role::Rudder] = std::nullopt;
             axis_selected_source[binding.dst] = std::nullopt;
             last_output_values[binding.dst] = 0;
         }
@@ -80,10 +80,14 @@ void BindingResolver::process_input(const PhysicalInput& input, int value) {
                       static_cast<int>(binding.dst.kind), binding.dst.code);
             
             if (binding.dst.kind == SrcKind::Key) {
-                int current_refcount = button_refcounts[binding.dst];
-                int new_refcount = current_refcount + (value ? 1 : -1);
-                button_refcounts[binding.dst] = std::max(0, new_refcount);
-                DEBUG_LOG("Button refcount: %d -> %d\n", current_refcount, new_refcount);
+                button_pressed_sources[binding.dst][binding.src] = (value != 0);
+                
+                int refcount = 0;
+                for (const auto& [source, pressed] : button_pressed_sources[binding.dst]) {
+                    if (pressed) refcount++;
+                }
+                button_refcounts[binding.dst] = refcount;
+                DEBUG_LOG("Button refcount: %d\n", refcount);
             } else {
                 int transformed_value = apply_axis_transform(value, binding.xform);
                 axis_values[binding.dst][input.role] = transformed_value;
@@ -112,18 +116,18 @@ std::vector<std::pair<VirtualSlot, int>> BindingResolver::get_pending_events() {
         bool has_value = false;
         
         // Priority: Stick > Throttle > Rudder
-        if (role_values.count(Role::Stick)) {
+        if (role_values.at(Role::Stick).has_value()) {
             selected_role = Role::Stick;
             has_value = true;
-        } else if (role_values.count(Role::Throttle)) {
+        } else if (role_values.at(Role::Throttle).has_value()) {
             selected_role = Role::Throttle;
             has_value = true;
-        } else if (role_values.count(Role::Rudder)) {
+        } else if (role_values.at(Role::Rudder).has_value()) {
             selected_role = Role::Rudder;
             has_value = true;
         }
         
-        int current_value = has_value ? role_values.at(selected_role) : 0;
+        int current_value = has_value ? *role_values.at(selected_role) : 0;
         int last_value = last_output_values.count(slot) ? last_output_values[slot] : 0;
         
         if (last_value != current_value) {

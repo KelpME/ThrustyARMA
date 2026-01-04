@@ -65,7 +65,8 @@ class BindingResolver {
 private:
     std::vector<Binding> bindings;
     std::map<VirtualSlot, int> button_refcounts;
-    std::map<VirtualSlot, std::map<Role, int>> axis_values;
+    std::map<VirtualSlot, std::map<PhysicalInput, bool>> button_pressed_sources;
+    std::map<VirtualSlot, std::map<Role, std::optional<int>>> axis_values;
     std::map<VirtualSlot, std::optional<Role>> axis_selected_source;
     std::map<VirtualSlot, int> last_output_values;
     

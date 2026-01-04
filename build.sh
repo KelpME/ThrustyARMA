@@ -16,7 +16,7 @@ case "${1:-build}" in
         mkdir -p "${BUILD_DIR}"
         cd "${BUILD_DIR}"
         
-        cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/.local"
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/.local" -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=bin
         cmake --build . --config Release
         
         echo "Built: ${BUILD_DIR}/bin/twcs_select"

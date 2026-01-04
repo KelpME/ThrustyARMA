@@ -17,6 +17,8 @@ This creates an Xbox 360 Controller-compatible virtual joystick that ARMA Reforg
 - **Role-based mapping**: Deterministic mapping based on device role (stick/throttle/rudder)
 - **Configurable device grabbing**: Per-device control via EVIOCGRAB
 - **Discovery mode**: Shows event codes for each device role
+- **TUI configuration tool**: Interactive terminal interface for binding management
+- **Custom bindings**: Physical-to-virtual input remapping with transforms
 - **Xbox 360 Controller compatibility**: Emulates Xbox 360 Controller (045e:028e) for ARMA Reforger
 - **Mixed axis ranges**: 16-bit signed (-32768 to 32767) for sticks, 8-bit (0-255) for triggers
 - **XInput-style buttons**: A, B, X, Y, LB, RB, Select, Start, LS, RS, Guide
@@ -188,6 +190,7 @@ You can customize physical-to-virtual mappings by adding a `bindings` section to
 ## Dependencies
 
 - **libevdev** - Linux input device handling
+- **ncurses** - Terminal UI for configuration tool
 - **CMake 3.16+** - Build system
 - **C++20** compiler
 
@@ -195,7 +198,7 @@ You can customize physical-to-virtual mappings by adding a `bindings` section to
 
 ```bash
 # Install dependencies
-sudo pacman -S libevdev cmake base-devel
+sudo pacman -S libevdev ncurses cmake base-devel
 ```
 
 ## Building
@@ -226,14 +229,38 @@ This will:
 - Show which devices were found
 - Save configuration with detected device paths
 
-### 2. Discovery Mode (Optional)
+### 2. Configuration Editor (TUI)
+```bash
+./build/bin/twcs_config
+```
+
+Launch the interactive terminal UI to manage device bindings:
+- View and edit virtual slot mappings
+- Add/delete bindings for keys and axes
+- Configure transforms (invert, deadzone, scale)
+- Save configuration to config.json
+- Validate bindings against virtual controller contract
+
+**TUI Controls:**
+- **↑↓/jk**: Select virtual slot
+- **←→**: Select binding within slot
+- **a**: Add new binding (select role: stick/throttle/rudder)
+- **d**: Delete selected binding
+- **s**: Save configuration
+- **q**: Quit (with unsaved changes prompt)
+- **i**: Toggle invalid bindings view
+- **?/h**: Show help
+
+**Note**: The TUI creates placeholder bindings with src=0. Edit `config.json` manually to set correct source event codes.
+
+### 3. Discovery Mode (Optional)
 ```bash
 TWCS_EVENT=/dev/input/by-id/usb-Thrustmaster_...-event-joystick ./build.sh discovery
 ```
 
-Shows event codes from the specified device for 10 seconds, useful for verifying mappings. **Note:** TWCS_EVENT environment variable is required for discovery mode.
+Shows event codes from the specified device for 10 seconds, useful for finding correct source codes for bindings. **Note:** TWCS_EVENT environment variable is required for discovery mode.
 
-### 3. Run Mapper
+### 4. Run Mapper
 ```bash
 # Load from config (recommended after running twcs_select)
 ./build.sh run
@@ -254,13 +281,54 @@ The mapper will:
 - Merge events using epoll for efficiency
 - Log device statuses and virtual device creation
 
-### 4. Configure ARMA Reforger
+### 5. Configure ARMA Reforger
 
 In ARMA Reforger, bind controls to the **virtual Xbox 360 Controller**. The virtual device will appear as:
 - "Xbox 360 Controller (Virtual)" if running without twcs_select
 - "Thrustmaster ARMA Virtual" if running after twcs_select
 
 ARMA Reforger will automatically recognize the virtual device as a gamepad. Use the gamepad control scheme, not individual joystick bindings.
+
+## Custom Bindings Guide
+
+### Finding Event Codes
+
+Use discovery mode to identify physical input event codes:
+```bash
+TWCS_EVENT=/dev/input/by-id/your-device-event-joystick ./build.sh discovery
+```
+
+Move your joystick/throttle buttons and axes to see their event codes during the 10-second capture window.
+
+### Manual Configuration
+
+You can also edit `~/.config/twcs-mapper/config.json` directly:
+
+**Key Binding Example:**
+```json
+{
+  "role": "stick",
+  "src": 288,        // BTN_TRIGGER from discovery
+  "dst": 304         // BTN_SOUTH (A button)
+}
+```
+
+**Axis Binding Example:**
+```json
+{
+  "role": "throttle",
+  "src": 1,          // ABS_Y from discovery  
+  "dst": 2,          // ABS_Z (left trigger)
+  "invert": true,     // Invert axis direction
+  "deadzone": 5,     // Deadzone before input registers
+  "scale": 1.5       // Sensitivity multiplier
+}
+```
+
+**Binding Priority System:**
+- Multiple physical inputs can map to the same virtual slot (OR semantics for buttons)
+- Axis priority: Stick > Throttle > Rudder when roles conflict
+- Invalid destination codes are ignored with warnings
 
 ## Device Selection Logic
 
@@ -351,8 +419,11 @@ ThrustyARMA/
 ├── src/
 │   ├── config.hpp         # Multi-device config interface
 │   ├── config.cpp         # JSON parsing/writing
+│   ├── bindings.hpp        # Binding resolution engine
+│   ├── bindings.cpp        # Binding implementation
 │   ├── twcs_select.cpp    # Multi-device detection
-│   └── twcs_mapper.cpp   # Multi-device merging daemon
+│   ├── twcs_mapper.cpp   # Multi-device merging daemon
+│   └── twcs_config.cpp   # TUI configuration editor
 ├── CMakeLists.txt        # Build system
 ├── build.sh              # Build script
 ├── twcs-mapper.service   # systemd user unit template
@@ -363,12 +434,35 @@ ThrustyARMA/
 
 - **Startup**: Load config or use defaults, validate devices, create Xbox 360 virtual device
 - **Merging**: Continuously merge Thrustmaster events into Xbox 360 Controller output
+- **Binding resolution**: Resolves conflicts using role-priority and OR semantics
 - **Graceful shutdown**: Clean up on SIGINT/SIGTERM, release grabs, destroy virtual device
 - **Resilience**: Optional device failures don't stop the daemon
 - **Fixed virtual controller**: Always creates 8 axes + 11 buttons contract for ARMA stability
-- **Configurable mappings**: Physical→virtual mappings can be customized (future TUI feature)
+- **Configurable mappings**: Physical→virtual mappings customizable via TUI or JSON
 - **Device priority**: Stick > throttle > rudder for button mappings
+
+### Binding Resolution System
+
+The mapper uses a sophisticated binding resolver with deterministic behavior:
+
+**Button Semantics (OR Logic):**
+- Multiple physical inputs can map to the same virtual button
+- Button is pressed if any mapped physical input is pressed
+- Each physical input tracked separately for accurate state
+
+**Axis Semantics (Priority-based):**
+- Lower priority axes are masked when higher priority axes are active
+- Priority order: Stick > Throttle > Rudder
+- Unset vs zero distinction prevents idle devices from masking active ones
+
+**Transform Pipeline:**
+- Invert: Reverse axis direction
+- Deadzone: Ignore small movements around center
+- Scale: Adjust sensitivity
+- Range clamping: Enforce output bounds for destination type
 
 ## License
 
-This project is provided as-is for educational and personal use.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+Copyright (c) 2026 KelpMe
