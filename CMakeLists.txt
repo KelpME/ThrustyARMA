@@ -30,6 +30,7 @@ target_compile_definitions(twcs_select PRIVATE _GNU_SOURCE)
 # Create twcs_mapper executable
 add_executable(twcs_mapper
     src/twcs_mapper.cpp
+    src/bindings.cpp
 )
 
 target_link_libraries(twcs_mapper config_lib ${EVDEV_LIBRARIES})

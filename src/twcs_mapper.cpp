@@ -1,4 +1,5 @@
 #include "config.hpp"
+#include "bindings.hpp"
 #include <linux/input.h>
 #include <linux/input-event-codes.h>
 #include <linux/uinput.h>
@@ -14,6 +15,7 @@
 #include <iostream>
 #include <array>
 #include <sstream>
+#include <fstream>
 #include <limits.h>
 #include <map>
 #include <vector>
@@ -35,49 +37,12 @@ struct InputDevice {
     std::string path;
 };
 
-// Role-specific mapping tables
-struct ButtonMapping {
-    int input_code;
-    int output_code;
-};
-
-struct AxisMapping {
-    int input_code;
-    int output_code;
-};
-
-// Stick mappings (X,Y, hat, buttons)
-static const AxisMapping stick_axis_mappings[] = {
-    {ABS_X, ABS_X},    // Stick X -> Virtual X
-    {ABS_Y, ABS_Y},    // Stick Y -> Virtual Y
-};
-
-// Throttle mappings (main axis, hat, buttons)
-static const AxisMapping throttle_axis_mappings[] = {
-    {ABS_Z, ABS_RX},   // Throttle -> Virtual RX
-    {ABS_HAT0X, ABS_HAT0X}, // Throttle hat -> Virtual hat X
-    {ABS_HAT0Y, ABS_HAT0Y}, // Throttle hat -> Virtual hat Y
-};
-
-// Rudder mappings (main axis, buttons)
-static const AxisMapping rudder_axis_mappings[] = {
-    {ABS_RZ, ABS_RY},  // Rudder -> Virtual RY
-};
-
-// Combined priority button mapping (assign outputs to avoid conflicts)
-// ARMA Reforger Gamepad button mapping (XInput-style)
-static const std::map<int, int> gamepad_button_mapping = {
-    {BTN_TRIGGER, BTN_SOUTH},    // A
-    {BTN_THUMB, BTN_EAST},       // B  
-    {BTN_THUMB2, BTN_WEST},      // X
-    {BTN_TOP, BTN_NORTH},        // Y
-    {BTN_TOP2, BTN_TL},          // LB
-    {BTN_PINKIE, BTN_TR},        // RB
-    {BTN_BASE, BTN_SELECT},      // Select
-    {BTN_BASE2, BTN_START},      // Start
-    {BTN_BASE3, BTN_THUMBL},     // LS
-    {BTN_BASE4, BTN_THUMBR},     // RS
-};
+Role string_to_role(const std::string& role_str) {
+    if (role_str == "stick") return Role::Stick;
+    if (role_str == "throttle") return Role::Throttle;
+    if (role_str == "rudder") return Role::Rudder;
+    return Role::Stick; // fallback
+}
 
 std::string get_udev_property(const std::string& device_path, const std::string& property) {
     std::string cmd = "udevadm info -q property -n " + device_path + " 2>/dev/null";
@@ -195,7 +160,287 @@ int discovery_mode(const Config& config) {
     return 0;
 }
 
+int diagnostics_mode(const Config& config) {
+    std::cout << "=== TWCS Mapper Diagnostics ===\n\n";
+    
+    // Configuration report
+    std::cout << "CONFIGURATION:\n";
+    std::cout << "  uinput_name: " << config.uinput_name << "\n";
+    std::cout << "  device_grab: " << (config.grab ? "enabled" : "disabled") << "\n";
+    std::cout << "  configured_inputs: " << config.inputs.size() << "\n";
+    
+    // Device detection report
+    std::cout << "\nDEVICE DETECTION:\n";
+    int detected_devices = 0;
+    int required_devices = 0;
+    int failed_required = 0;
+    
+    for (const auto& input_config : config.inputs) {
+        if (!input_config.optional) {
+            required_devices++;
+        }
+        
+        std::cout << "  " << input_config.role << ":\n";
+        std::cout << "    configured_path: " << input_config.by_id << "\n";
+        std::cout << "    expected_vendor: " << input_config.vendor << "\n";
+        std::cout << "    expected_product: " << input_config.product << "\n";
+        std::cout << "    optional: " << (input_config.optional ? "yes" : "no") << "\n";
+        
+        if (input_config.by_id.empty()) {
+            std::cout << "    status: NOT_CONFIGURED\n";
+            continue;
+        }
+        
+        char real_path[PATH_MAX];
+        if (realpath(input_config.by_id.c_str(), real_path) == nullptr) {
+            std::cout << "    status: PATH_RESOLUTION_FAILED\n";
+            if (!input_config.optional) {
+                failed_required++;
+            }
+            continue;
+        }
+        
+        std::cout << "    resolved_path: " << real_path << "\n";
+        
+        int fd = open(real_path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) {
+            std::cout << "    status: ACCESS_FAILED (" << strerror(errno) << ")\n";
+            if (!input_config.optional) {
+                failed_required++;
+            }
+            continue;
+        }
+
+        struct libevdev* dev = nullptr;
+        int rc = libevdev_new_from_fd(fd, &dev);
+        if (rc < 0) {
+            std::cout << "    status: INITIALIZATION_FAILED (" << strerror(-rc) << ")\n";
+            close(fd);
+            if (!input_config.optional) {
+                failed_required++;
+            }
+            continue;
+        }
+        
+        // Get actual device properties
+        std::string actual_vendor = get_udev_property(real_path, "ID_VENDOR_ID");
+        std::string actual_product = get_udev_property(real_path, "ID_MODEL_ID");
+        const char* device_name = libevdev_get_name(dev);
+        
+        std::cout << "    device_name: " << (device_name ? device_name : "UNKNOWN") << "\n";
+        std::cout << "    actual_vendor: " << actual_vendor << "\n";
+        std::cout << "    actual_product: " << actual_product << "\n";
+        
+        bool validation_ok = validate_device(real_path, input_config.vendor, input_config.product);
+        if (validation_ok) {
+            std::cout << "    status: DETECTED_OK\n";
+            detected_devices++;
+        } else {
+            std::cout << "    status: VALIDATION_FAILED\n";
+            if (!input_config.optional) {
+                failed_required++;
+            }
+        }
+        
+        libevdev_free(dev);
+        close(fd);
+    }
+    
+    std::cout << "\n  Summary: " << detected_devices << "/" << config.inputs.size() << " devices detected";
+    if (failed_required > 0) {
+        std::cout << " (" << failed_required << " required devices missing)";
+    }
+    std::cout << "\n";
+    
+    // Bindings report
+    std::cout << "\nBINDINGS:\n";
+    
+    std::vector<Binding> bindings;
+    if (!config.bindings_keys.empty() || !config.bindings_abs.empty()) {
+        auto config_bindings = make_bindings_from_config(config.bindings_keys, config.bindings_abs);
+        std::vector<Binding> valid_config_bindings;
+        for (const auto& binding : config_bindings) {
+            if (validate_bindings({binding})) {
+                valid_config_bindings.push_back(binding);
+            }
+        }
+        
+        if (!valid_config_bindings.empty()) {
+            bindings = valid_config_bindings;
+            std::cout << "  config_bindings: " << bindings.size() << " loaded from config\n";
+        } else {
+            bindings = make_default_bindings();
+            std::cout << "  config_bindings: ALL INVALID (using defaults)\n";
+        }
+    } else {
+        bindings = make_default_bindings();
+        std::cout << "  config_bindings: none configured (using defaults)\n";
+    }
+    
+    std::cout << "  active_bindings: " << bindings.size() << "\n";
+    
+    // Group bindings by type for clearer reporting
+    std::map<std::string, std::vector<const Binding*>> role_bindings;
+    for (const auto& binding : bindings) {
+        std::string role_name;
+        switch (binding.src.role) {
+            case Role::Stick: role_name = "stick"; break;
+            case Role::Throttle: role_name = "throttle"; break;
+            case Role::Rudder: role_name = "rudder"; break;
+        }
+        role_bindings[role_name].push_back(&binding);
+    }
+    
+    for (const auto& [role_name, role_binding_list] : role_bindings) {
+        std::cout << "    " << role_name << " (" << role_binding_list.size() << " bindings):\n";
+        for (const auto* binding : role_binding_list) {
+            std::cout << "      ";
+            if (binding->src.kind == SrcKind::Key) {
+                const char* btn_name = libevdev_event_code_get_name(EV_KEY, binding->src.code);
+                std::cout << "KEY " << (btn_name ? btn_name : "UNKNOWN") << " (" << binding->src.code << ")";
+            } else {
+                const char* axis_name = libevdev_event_code_get_name(EV_ABS, binding->src.code);
+                std::cout << "ABS " << (axis_name ? axis_name : "UNKNOWN") << " (" << binding->src.code << ")";
+            }
+            
+            std::cout << " -> ";
+            if (binding->dst.kind == SrcKind::Key) {
+                const char* btn_name = libevdev_event_code_get_name(EV_KEY, binding->dst.code);
+                std::cout << "BTN " << (btn_name ? btn_name : "UNKNOWN") << " (" << binding->dst.code << ")";
+            } else {
+                const char* axis_name = libevdev_event_code_get_name(EV_ABS, binding->dst.code);
+                std::cout << "ABS " << (axis_name ? axis_name : "UNKNOWN") << " (" << binding->dst.code << ")";
+                
+                if (binding->xform.invert || binding->xform.deadzone > 0 || binding->xform.scale != 1.0f) {
+                    std::cout << " [";
+                    if (binding->xform.invert) std::cout << "invert ";
+                    if (binding->xform.deadzone > 0) std::cout << "deadzone=" << binding->xform.deadzone << " ";
+                    if (binding->xform.scale != 1.0f) std::cout << "scale=" << binding->xform.scale << " ";
+                    std::cout << "\b]";
+                }
+            }
+            std::cout << "\n";
+        }
+    }
+    
+    // Service state check
+    std::cout << "\nSERVICE STATE:\n";
+    
+    // Check if service file exists
+    std::string service_path = std::string(getenv("HOME")) + "/.config/systemd/user/twcs-mapper.service";
+    std::ifstream service_file(service_path);
+    if (service_file.good()) {
+        std::cout << "  service_file: EXISTS (" << service_path << ")\n";
+        
+        // Try to get service status via systemctl
+        FILE* pipe = popen("systemctl --user is-active twcs-mapper.service 2>/dev/null", "r");
+        if (pipe) {
+            char buffer[128];
+            std::string result;
+            if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                result = buffer;
+                result.erase(result.find_last_not_of("\n\r") + 1);
+                std::cout << "  service_status: " << result << "\n";
+            } else {
+                std::cout << "  service_status: UNKNOWN\n";
+            }
+            pclose(pipe);
+        }
+        
+        // Check if service is enabled
+        pipe = popen("systemctl --user is-enabled twcs-mapper.service 2>/dev/null", "r");
+        if (pipe) {
+            char buffer[128];
+            std::string result;
+            if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                result = buffer;
+                result.erase(result.find_last_not_of("\n\r") + 1);
+                std::cout << "  service_enabled: " << result << "\n";
+            } else {
+                std::cout << "  service_enabled: UNKNOWN\n";
+            }
+            pclose(pipe);
+        }
+    } else {
+        std::cout << "  service_file: NOT_FOUND\n";
+    }
+    
+    // uinput availability check
+    std::cout << "\nSYSTEM CHECKS:\n";
+    int uinput_check = open("/dev/uinput", O_RDWR | O_NONBLOCK);
+    if (uinput_check >= 0) {
+        std::cout << "  /dev/uinput: ACCESSIBLE\n";
+        close(uinput_check);
+    } else {
+        std::cout << "  /dev/uinput: NOT_ACCESSIBLE (" << strerror(errno) << ")\n";
+    }
+    
+    // Check user in input group
+    std::cout << "  user_groups: ";
+    FILE* groups_pipe = popen("groups", "r");
+    if (groups_pipe) {
+        char buffer[256];
+        if (fgets(buffer, sizeof(buffer), groups_pipe) != nullptr) {
+            std::string groups = buffer;
+            groups.erase(groups.find_last_not_of("\n\r") + 1);
+            std::cout << groups;
+            if (groups.find("input") != std::string::npos) {
+                std::cout << " (input group present)";
+            } else {
+                std::cout << " (input group missing - may affect device access)";
+            }
+        } else {
+            std::cout << "UNKNOWN";
+        }
+        pclose(groups_pipe);
+    }
+    std::cout << "\n";
+    
+    // Overall health summary
+    std::cout << "\nHEALTH SUMMARY:\n";
+    bool overall_healthy = true;
+    
+    if (detected_devices < required_devices) {
+        std::cout << "  ERROR: Required devices missing\n";
+        overall_healthy = false;
+    }
+    
+    if (bindings.empty()) {
+        std::cout << "  ERROR: No active bindings\n";
+        overall_healthy = false;
+    }
+    
+    if (uinput_check < 0) {
+        std::cout << "  ERROR: Cannot access /dev/uinput\n";
+        overall_healthy = false;
+    }
+    
+    if (overall_healthy) {
+        std::cout << "  STATUS: HEALTHY\n";
+    } else {
+        std::cout << "  STATUS: ISSUES_DETECTED\n";
+    }
+    
+    return overall_healthy ? 0 : 1;
+}
+
+void print_usage(const char* program_name) {
+    std::cout << "Usage: " << program_name << " [OPTION]\n";
+    std::cout << "TWCS ARMA Mapper - Virtual controller mapping for flight controls\n\n";
+    std::cout << "Options:\n";
+    std::cout << "  --print-map     Interactive discovery mode to map device controls\n";
+    std::cout << "  --diagnostics   Non-interactive diagnostics reporting device detection, bindings, and service state\n";
+    std::cout << "  --help          Show this help message\n\n";
+    std::cout << "When run without options, the mapper starts in normal mode, creating and managing the virtual controller.\n";
+}
+
 int main(int argc, char* argv[]) {
+    // Check for help option first, before any other operations
+    if (argc >= 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+        print_usage(argv[0]);
+        return 0;
+    }
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
@@ -226,6 +471,11 @@ int main(int argc, char* argv[]) {
     // Check for discovery mode
     if (argc >= 2 && strcmp(argv[1], "--print-map") == 0) {
         return discovery_mode(config);
+    }
+
+    // Check for diagnostics mode
+    if (argc >= 2 && strcmp(argv[1], "--diagnostics") == 0) {
+        return diagnostics_mode(config);
     }
 
     // Open and validate all devices
@@ -441,6 +691,45 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Initialize binding resolver
+    std::vector<Binding> bindings;
+    
+    // Try to load bindings from config, fall back to defaults if none or invalid
+    if (!config.bindings_keys.empty() || !config.bindings_abs.empty()) {
+        auto config_bindings = make_bindings_from_config(config.bindings_keys, config.bindings_abs);
+        
+        // Validate config bindings and filter out invalid ones
+        std::vector<Binding> valid_config_bindings;
+        for (const auto& binding : config_bindings) {
+            if (validate_bindings({binding})) {
+                valid_config_bindings.push_back(binding);
+            } else {
+                std::cout << "WARNING: Ignored invalid binding targeting virtual controller contract violation\n";
+            }
+        }
+        
+        if (!valid_config_bindings.empty()) {
+            bindings = valid_config_bindings;
+            std::cout << "Loaded " << bindings.size() << " bindings from config\n";
+        } else {
+            std::cout << "WARNING: All config bindings were invalid, falling back to defaults\n";
+            bindings = make_default_bindings();
+        }
+    } else {
+        bindings = make_default_bindings();
+        std::cout << "Loaded " << bindings.size() << " default bindings\n";
+    }
+    
+    BindingResolver resolver(bindings);
+    
+#ifdef DEBUG_BINDINGS
+    const char* debug_env = getenv("TWCS_DEBUG_BINDINGS");
+    debug_bindings_enabled = (debug_env && strcmp(debug_env, "1") == 0);
+    if (debug_bindings_enabled) {
+        printf("Debug bindings enabled\n");
+    }
+#endif
+
     // Main event loop - Virtual Controller Contract must remain fixed
     // Axes: 8 (ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y)
     // Buttons: 11 (Face 4, Shoulders 2, System 3, Stick clicks 2)
@@ -477,73 +766,45 @@ int main(int argc, char* argv[]) {
                 
                 switch (ev.type) {
                     case EV_ABS: {
-                        // Virtual Controller Contract: Map to fixed 8-axis layout
-                        if (source_device->role == "stick") {
-                            // Stick -> Left stick (ABS_X, ABS_Y)
-                            if (ev.code == ABS_X || ev.code == ABS_Y) {
-                                int value = ev.value;
-                                int min = libevdev_get_abs_minimum(source_device->dev, ev.code);
-                                int max = libevdev_get_abs_maximum(source_device->dev, ev.code);
-                                if (min != max) {
-                                    value = (value - min) * 65535 / (max - min) - 32768;
-                                    if (value > 32767) value = 32767;
-                                    if (value < -32768) value = -32768;
-                                }
-                                // Keep same axis codes for left stick
-                                ev.value = value;
-                                if (write(uinput_fd, &ev, sizeof(ev)) >= 0) events_written = true;
+                        // Apply axis transformation based on original logic
+                        int transformed_value = ev.value;
+                        Role role = string_to_role(source_device->role);
+                        
+                        // Apply range conversion as in original code
+                        if (ev.code == ABS_X || ev.code == ABS_Y) {
+                            // Stick axes: convert to 16-bit signed
+                            int min = libevdev_get_abs_minimum(source_device->dev, ev.code);
+                            int max = libevdev_get_abs_maximum(source_device->dev, ev.code);
+                            if (min != max) {
+                                transformed_value = (transformed_value - min) * 65535 / (max - min) - 32768;
+                                if (transformed_value > 32767) transformed_value = 32767;
+                                if (transformed_value < -32768) transformed_value = -32768;
                             }
-                            // Stick hat -> D-pad (ABS_HAT0X, ABS_HAT0Y)
-                            else if (ev.code == ABS_HAT0X || ev.code == ABS_HAT0Y) {
-                                ev.value = (ev.value > 0) ? 1 : ((ev.value < 0) ? -1 : 0);
-                                if (write(uinput_fd, &ev, sizeof(ev)) >= 0) events_written = true;
+                        } else if (ev.code == ABS_Z || ev.code == ABS_RZ || ev.code == ABS_THROTTLE) {
+                            // Trigger axes: convert to 0-255
+                            int min = libevdev_get_abs_minimum(source_device->dev, ev.code);
+                            int max = libevdev_get_abs_maximum(source_device->dev, ev.code);
+                            if (min != max) {
+                                transformed_value = (transformed_value - min) * 255 / (max - min);
+                                if (transformed_value > 255) transformed_value = 255;
+                                if (transformed_value < 0) transformed_value = 0;
                             }
-                        } else if (source_device->role == "throttle") {
-                            // Throttle axis -> Left trigger (ABS_Z)
-                            if (ev.code == ABS_Z || ev.code == ABS_THROTTLE) {
-                                int min = libevdev_get_abs_minimum(source_device->dev, ev.code);
-                                int max = libevdev_get_abs_maximum(source_device->dev, ev.code);
-                                int value = ev.value;
-                                if (min != max) {
-                                    value = (value - min) * 255 / (max - min);
-                                    if (value > 255) value = 255;
-                                    if (value < 0) value = 0;
-                                }
-                                ev.code = ABS_Z;  // Left trigger
-                                ev.value = value;
-                                if (write(uinput_fd, &ev, sizeof(ev)) >= 0) events_written = true;
-                            }
-                            // Throttle hat -> D-pad (but left stick takes precedence if available)
-                            else if (ev.code == ABS_HAT0X || ev.code == ABS_HAT0Y) {
-                                ev.value = (ev.value > 0) ? 1 : ((ev.value < 0) ? -1 : 0);
-                                if (write(uinput_fd, &ev, sizeof(ev)) >= 0) events_written = true;
-                            }
-                        } else if (source_device->role == "rudder") {
-                            // Rudder -> Right trigger (ABS_RZ) or Right stick X (ABS_RX)
-                            if (ev.code == ABS_RZ) {
-                                int min = libevdev_get_abs_minimum(source_device->dev, ev.code);
-                                int max = libevdev_get_abs_maximum(source_device->dev, ev.code);
-                                int value = ev.value;
-                                if (min != max) {
-                                    value = (value - min) * 255 / (max - min);
-                                    if (value > 255) value = 255;
-                                    if (value < 0) value = 0;
-                                }
-                                ev.code = ABS_RZ;  // Right trigger
-                                ev.value = value;
-                                if (write(uinput_fd, &ev, sizeof(ev)) >= 0) events_written = true;
-                            }
+                        } else if (ev.code == ABS_HAT0X || ev.code == ABS_HAT0Y) {
+                            // Hat axes: convert to -1, 0, 1
+                            transformed_value = (transformed_value > 0) ? 1 : ((transformed_value < 0) ? -1 : 0);
                         }
+                        
+                        // Process through binding resolver
+                        PhysicalInput input{role, SrcKind::Abs, static_cast<uint16_t>(ev.code)};
+                        resolver.process_input(input, transformed_value);
                         break;
                     }
                     
                     case EV_KEY: {
-                        // Virtual Controller Contract: Map to fixed 11-button layout
-                        auto mapping_it = gamepad_button_mapping.find(ev.code);
-                        if (mapping_it != gamepad_button_mapping.end()) {
-                            ev.code = mapping_it->second;
-                            if (write(uinput_fd, &ev, sizeof(ev)) >= 0) events_written = true;
-                        }
+                        // Process through binding resolver
+                        Role role = string_to_role(source_device->role);
+                        PhysicalInput input{role, SrcKind::Key, static_cast<uint16_t>(ev.code)};
+                        resolver.process_input(input, ev.value);
                         break;
                     }
                     
@@ -554,6 +815,22 @@ int main(int argc, char* argv[]) {
                         }
                         break;
                 }
+                
+                // Emit any pending virtual events
+                auto pending_events = resolver.get_pending_events();
+                for (const auto& [slot, value] : pending_events) {
+                    struct input_event out_ev;
+                    memset(&out_ev, 0, sizeof(out_ev));
+                    out_ev.type = (slot.kind == SrcKind::Key) ? EV_KEY : EV_ABS;
+                    out_ev.code = slot.code;
+                    out_ev.value = value;
+                    
+                    if (write(uinput_fd, &out_ev, sizeof(out_ev)) >= 0) {
+                        events_written = true;
+                    }
+                }
+                
+                resolver.clear_pending_events();
                 
                 // Emit sync if we wrote events
                 if (events_written) {

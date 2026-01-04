@@ -1,0 +1,1 @@
+{"uinput_name":"Test","grab":true,"inputs":[],"bindings":{"keys":[{"role":"stick","src":288,"dst":304}],"abs":[{"role":"throttle","src":0,"dst":2,"invert":true,"deadzone":5,"scale":1.5}]}}

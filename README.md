@@ -114,7 +114,26 @@ ARMA binding stability depends on this contract remaining exactly as specified.
       "product": "b679",
       "optional": true
     }
-  ]
+  ],
+  "bindings": {
+    "keys": [
+      {
+        "role": "stick",
+        "src": 288,
+        "dst": 304
+      }
+    ],
+    "abs": [
+      {
+        "role": "throttle",
+        "src": 0,
+        "dst": 2,
+        "invert": true,
+        "deadzone": 5,
+        "scale": 1.5
+      }
+    ]
+  }
 }
 ```
 
@@ -127,6 +146,44 @@ ARMA binding stability depends on this contract remaining exactly as specified.
   - `vendor`: Expected USB vendor ID
   - `product`: Expected USB product ID  
   - `optional`: Whether device can be missing
+
+### Custom Bindings Configuration
+
+You can customize physical-to-virtual mappings by adding a `bindings` section to your config. If no bindings are specified, the mapper uses default mappings.
+
+**Keys Bindings (EV_KEY):**
+```json
+"keys": [
+  {
+    "role": "stick",      // Device role: "stick", "throttle", or "rudder"
+    "src": 288,          // Input event code (BTN_TRIGGER)
+    "dst": 304           // Output event code (BTN_SOUTH)
+  }
+]
+```
+
+**Absolute Bindings (EV_ABS):**
+```json
+"abs": [
+  {
+    "role": "throttle",   // Device role: "stick", "throttle", or "rudder"
+    "src": 0,            // Input event code (ABS_X)
+    "dst": 2,            // Output event code (ABS_Z)
+    "invert": true,       // Optional: invert the axis (default: false)
+    "deadzone": 5,       // Optional: deadzone to apply (default: 0)
+    "scale": 1.5         // Optional: scaling factor (default: 1.0)
+  }
+]
+```
+
+**Binding Rules:**
+- Output ranges are automatically derived from destination axis code to match the frozen virtual controller contract:
+  - `ABS_X`, `ABS_Y`, `ABS_RX`, `ABS_RY` → `[-32768, 32767]`
+  - `ABS_Z`, `ABS_RZ` → `[0, 255]`
+  - `ABS_HAT0X`, `ABS_HAT0Y` → `[-1, 1]`
+- Invalid destination codes (outside frozen contract) are ignored with warnings
+- Multiple physical inputs can map to the same virtual button (OR semantics)
+- Axis priority: Stick > Throttle > Rudder for conflicting mappings
 
 ## Dependencies
 

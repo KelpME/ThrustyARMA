@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdio>
 #include <sys/stat.h>
+#include <sstream>
 
 std::optional<Config> ConfigManager::load(const std::string& config_path) {
     std::ifstream file(config_path);
@@ -30,6 +31,8 @@ std::optional<Config> ConfigManager::load(const std::string& config_path) {
     }
 
     config.inputs = parse_inputs(json);
+    config.bindings_keys = parse_bindings_keys(json);
+    config.bindings_abs = parse_bindings_abs(json);
 
     return config;
 }
@@ -120,7 +123,56 @@ bool ConfigManager::save(const std::string& config_path, const Config& config) {
         file << (i < config.inputs.size() - 1 ? "    },\n" : "    }\n");
     }
 
-    file << "  ]\n";
+    file << "  ]";
+    
+    // Add bindings if present
+    if (!config.bindings_keys.empty() || !config.bindings_abs.empty()) {
+        file << ",\n";
+        file << "  \"bindings\": {\n";
+        
+        // Keys
+        file << "    \"keys\": [\n";
+        for (size_t i = 0; i < config.bindings_keys.size(); i++) {
+            const auto& binding = config.bindings_keys[i];
+            file << "      {\n";
+            file << "        \"role\": \"" << escape_json_string(binding.role) << "\",\n";
+            file << "        \"src\": " << binding.src << ",\n";
+            file << "        \"dst\": " << binding.dst << "\n";
+            file << "      }";
+            file << (i < config.bindings_keys.size() - 1 ? ",\n" : "\n");
+        }
+        file << "    ]";
+        
+        // ABS
+        if (!config.bindings_abs.empty()) {
+            file << ",\n";
+            file << "    \"abs\": [\n";
+            for (size_t i = 0; i < config.bindings_abs.size(); i++) {
+                const auto& binding = config.bindings_abs[i];
+                file << "      {\n";
+                file << "        \"role\": \"" << escape_json_string(binding.role) << "\",\n";
+                file << "        \"src\": " << binding.src << ",\n";
+                file << "        \"dst\": " << binding.dst << ",\n";
+                file << "        \"invert\": " << (binding.invert ? "true" : "false") << ",\n";
+                file << "        \"deadzone\": " << binding.deadzone << ",\n";
+                
+                // Use ostringstream for minimal decimal representation
+                std::ostringstream scale_stream;
+                scale_stream << binding.scale;
+                file << "        \"scale\": " << scale_stream.str() << "\n";
+                file << "      }";
+                file << (i < config.bindings_abs.size() - 1 ? ",\n" : "\n");
+            }
+            file << "    ]\n";
+        } else {
+            file << "\n";
+        }
+        
+        file << "  }\n";
+    } else {
+        file << "\n";
+    }
+    
     file << "}";
 
     return file.good();
@@ -247,4 +299,134 @@ std::optional<std::string> ConfigManager::get_json_value(const std::string& json
         value.erase(value.find_last_not_of(" \t\r\n") + 1);
         return value;
     }
+}
+
+std::vector<BindingConfigKey> ConfigManager::parse_bindings_keys(const std::string& json) {
+    std::vector<BindingConfigKey> bindings;
+
+    auto bindings_array_opt = get_json_value(json, "bindings");
+    if (!bindings_array_opt) {
+        return bindings;
+    }
+
+    std::string bindings_str = *bindings_array_opt;
+    auto keys_array_opt = get_json_value(bindings_str, "keys");
+    if (!keys_array_opt) {
+        return bindings;
+    }
+
+    std::string keys_str = *keys_array_opt;
+    // Remove surrounding brackets if present
+    if (!keys_str.empty() && keys_str.front() == '[' && keys_str.back() == ']') {
+        keys_str = keys_str.substr(1, keys_str.length() - 2);
+    }
+
+    // Parse individual objects
+    size_t pos = 0;
+    while (pos < keys_str.length()) {
+        size_t obj_start = keys_str.find('{', pos);
+        if (obj_start == std::string::npos) break;
+
+        // Find matching brace
+        int brace_count = 1;
+        size_t obj_end = obj_start + 1;
+        while (obj_end < keys_str.length() && brace_count > 0) {
+            if (keys_str[obj_end] == '{') brace_count++;
+            else if (keys_str[obj_end] == '}') brace_count--;
+            obj_end++;
+        }
+
+        if (brace_count == 0) {
+            std::string obj_str = keys_str.substr(obj_start, obj_end - obj_start);
+
+            BindingConfigKey binding;
+            auto role_opt = get_json_value(obj_str, "role");
+            auto src_opt = get_json_value(obj_str, "src");
+            auto dst_opt = get_json_value(obj_str, "dst");
+
+            if (role_opt && src_opt && dst_opt) {
+                binding.role = *role_opt;
+                binding.src = std::stoi(*src_opt);
+                binding.dst = std::stoi(*dst_opt);
+                bindings.push_back(binding);
+            }
+        }
+
+        pos = obj_end;
+    }
+
+    return bindings;
+}
+
+std::vector<BindingConfigAbs> ConfigManager::parse_bindings_abs(const std::string& json) {
+    std::vector<BindingConfigAbs> bindings;
+
+    auto bindings_array_opt = get_json_value(json, "bindings");
+    if (!bindings_array_opt) {
+        return bindings;
+    }
+
+    std::string bindings_str = *bindings_array_opt;
+    auto abs_array_opt = get_json_value(bindings_str, "abs");
+    if (!abs_array_opt) {
+        return bindings;
+    }
+
+    std::string abs_str = *abs_array_opt;
+    // Remove surrounding brackets if present
+    if (!abs_str.empty() && abs_str.front() == '[' && abs_str.back() == ']') {
+        abs_str = abs_str.substr(1, abs_str.length() - 2);
+    }
+
+    // Parse individual objects
+    size_t pos = 0;
+    while (pos < abs_str.length()) {
+        size_t obj_start = abs_str.find('{', pos);
+        if (obj_start == std::string::npos) break;
+
+        // Find matching brace
+        int brace_count = 1;
+        size_t obj_end = obj_start + 1;
+        while (obj_end < abs_str.length() && brace_count > 0) {
+            if (abs_str[obj_end] == '{') brace_count++;
+            else if (abs_str[obj_end] == '}') brace_count--;
+            obj_end++;
+        }
+
+        if (brace_count == 0) {
+            std::string obj_str = abs_str.substr(obj_start, obj_end - obj_start);
+
+            BindingConfigAbs binding;
+            auto role_opt = get_json_value(obj_str, "role");
+            auto src_opt = get_json_value(obj_str, "src");
+            auto dst_opt = get_json_value(obj_str, "dst");
+
+            if (role_opt && src_opt && dst_opt) {
+                binding.role = *role_opt;
+                binding.src = std::stoi(*src_opt);
+                binding.dst = std::stoi(*dst_opt);
+
+                auto invert_opt = get_json_value(obj_str, "invert");
+                if (invert_opt) {
+                    binding.invert = (*invert_opt == "true");
+                }
+
+                auto deadzone_opt = get_json_value(obj_str, "deadzone");
+                if (deadzone_opt) {
+                    binding.deadzone = std::stoi(*deadzone_opt);
+                }
+
+                auto scale_opt = get_json_value(obj_str, "scale");
+                if (scale_opt) {
+                    binding.scale = std::stof(*scale_opt);
+                }
+
+                bindings.push_back(binding);
+            }
+        }
+
+        pos = obj_end;
+    }
+
+    return bindings;
 }
