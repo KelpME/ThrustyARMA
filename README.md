@@ -218,16 +218,26 @@ cmake --build . --config Release
 
 ## Usage
 
-### 1. Detect and Configure Devices
+### 1. Device Selection and Configuration
 ```bash
-./build/bin/twcs_select
+./build/bin/twcs_setup
 ```
 
 This will:
-- Scan `/dev/input/by-id` for Thrustmaster devices
-- Auto-detect T.16000M (required), TWCS, and T-Rudder (optional)
-- Show which devices were found
-- Save configuration with detected device paths
+- Load existing `~/.config/twcs-mapper/config.json` if present
+- **Primary mode**: Build device candidates from `config.inputs` (exact by-id paths you specified)
+- **Fallback mode**: Auto-scan `/dev/input/by-id` only if config has no valid inputs
+- Enumerate available candidates for each role (stick, throttle, rudder)
+- Let you choose one device per role when multiple options exist
+- Capture axes one at a time for precise ARMA helicopter mapping:
+  - **Cyclic X/Y** (right stick) -> ABS_RX/ABS_RY
+  - **Collective** (throttle) -> ABS_Y  
+  - **Anti-torque** (rudder) -> ABS_X
+- Allow per-axis invert preference
+- Capture buttons in sequence with retry capability
+- Save ARMA-specific configuration
+
+**Config-driven device selection**: Edit `~/.config/twcs-mapper/config.json` → `inputs` array to control which devices appear in the selection list. Use exact `by_id` paths to ensure correct TWCS throttle and T-Rudder devices are available.
 
 ### 2. Configuration Editor (TUI)
 ```bash
@@ -281,13 +291,33 @@ The mapper will:
 - Merge events using epoll for efficiency
 - Log device statuses and virtual device creation
 
-### 5. Configure ARMA Reforger
+### 5. Verify ARMA Helicopter Controls
 
-In ARMA Reforger, bind controls to the **virtual Xbox 360 Controller**. The virtual device will appear as:
-- "Xbox 360 Controller (Virtual)" if running without twcs_select
-- "Thrustmaster ARMA Virtual" if running after twcs_select
+Before launching ARMA, verify the mapping works correctly:
 
-ARMA Reforger will automatically recognize the virtual device as a gamepad. Use the gamepad control scheme, not individual joystick bindings.
+```bash
+# Real-time axis diagnostics
+./build/bin/twcs_mapper --diag-axes
+```
+
+Move your controls and observe the output:
+- **Physical stick X** should only affect **ABS_RX** (right stick X - cyclic)
+- **Physical stick Y** should only affect **ABS_RY** (right stick Y - cyclic)  
+- **Physical rudder** should only affect **ABS_X** (left stick X - anti-torque)
+- **Physical throttle** should only affect **ABS_Y** (left stick Y - collective)
+
+If movement appears on wrong virtual axes, re-run `twcs_setup` to capture axes again.
+
+### 6. Configure ARMA Reforger
+
+In ARMA Reforger, bind helicopter controls to the **virtual "Thrustmaster ARMA Virtual" controller**:
+
+- **Cyclic (pitch/roll)**: Right stick X/Y axes
+- **Collective**: Left stick Y axis  
+- **Anti-torque (yaw)**: Left stick X axis
+- **Buttons**: Map as needed to virtual gamepad buttons
+
+ARMA Reforger will recognize the virtual device as an Xbox 360 Controller. Use the gamepad control scheme for proper helicopter control.
 
 ## Custom Bindings Guide
 

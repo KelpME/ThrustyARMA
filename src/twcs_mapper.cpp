@@ -612,14 +612,225 @@ int diagnostics_mode(const Config& config) {
     return overall_healthy ? 0 : 1;
 }
 
+int diag_axes_mode(const Config& config) {
+    std::cout << "=== TWCS ARMA Axis Diagnostics ===\n";
+    std::cout << "Showing real-time axis mappings for ARMA helicopter controls.\n";
+    std::cout << "Press Ctrl+C to stop.\n\n";
+    
+    // Open and validate all devices
+    std::vector<InputDevice> input_devices;
+    
+    for (const auto& input_config : config.inputs) {
+        if (input_config.by_id.empty()) {
+            std::cout << "Skipping " << input_config.role << " (not configured)\n";
+            continue;
+        }
+        
+        char real_path[PATH_MAX];
+        if (realpath(input_config.by_id.c_str(), real_path) == nullptr) {
+            std::cerr << "Failed to resolve " << input_config.role << " path: " << input_config.by_id << "\n";
+            continue;
+        }
+        
+        int fd = open(real_path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) {
+            perror(("Failed to open " + input_config.role).c_str());
+            continue;
+        }
+
+        struct libevdev* dev = nullptr;
+        int rc = libevdev_new_from_fd(fd, &dev);
+        if (rc < 0) {
+            perror(("Failed to init " + input_config.role).c_str());
+            close(fd);
+            continue;
+        }
+        
+        if (!validate_device(real_path, input_config.vendor, input_config.product)) {
+            std::cerr << "Device validation failed for " << input_config.role << "\n";
+            libevdev_free(dev);
+            close(fd);
+            continue;
+        }
+        
+        InputDevice device;
+        device.role = input_config.role;
+        device.fd = fd;
+        device.dev = dev;
+        device.path = real_path;
+        device.by_id_path = input_config.by_id;
+        device.vendor = input_config.vendor;
+        device.product = input_config.product;
+        device.optional = input_config.optional;
+        device.online = true;
+        device.consecutive_read_failures = 0;
+        device.reconnect_backoff_ms = 500;
+        device.last_reconnect_attempt = std::chrono::steady_clock::now();
+        input_devices.push_back(device);
+        
+        std::cout << "Opened " << input_config.role << ": " << input_config.by_id << "\n";
+    }
+    
+    if (input_devices.empty()) {
+        std::cerr << "No input devices available\n";
+        return 1;
+    }
+    
+    // Initialize binding resolver
+    std::vector<Binding> bindings;
+    if (!config.bindings_keys.empty() || !config.bindings_abs.empty()) {
+        auto config_bindings = make_bindings_from_config(config.bindings_keys, config.bindings_abs);
+        
+        std::vector<Binding> valid_config_bindings;
+        for (const auto& binding : config_bindings) {
+            if (validate_bindings({binding})) {
+                valid_config_bindings.push_back(binding);
+            }
+        }
+        
+        if (!valid_config_bindings.empty()) {
+            bindings = valid_config_bindings;
+        } else {
+            bindings = make_default_bindings();
+        }
+    } else {
+        bindings = make_default_bindings();
+    }
+    
+    validate_and_filter_bindings(bindings, input_devices);
+    BindingResolver resolver(bindings);
+    
+    // Print active bindings
+    std::cout << "\nActive ARMA helicopter axis bindings:\n";
+    for (const auto& binding : bindings) {
+        if (binding.dst.kind == SrcKind::Abs) {
+            std::string dst_name;
+            if (binding.dst.code == ABS_RX) dst_name = "ABS_RX (Cyclic X)";
+            else if (binding.dst.code == ABS_RY) dst_name = "ABS_RY (Cyclic Y)";
+            else if (binding.dst.code == ABS_X) dst_name = "ABS_X (Anti-torque)";
+            else if (binding.dst.code == ABS_Y) dst_name = "ABS_Y (Collective)";
+            else dst_name = "ABS_" + std::to_string(binding.dst.code);
+            
+            const char* src_name = libevdev_event_code_get_name(EV_ABS, binding.src.code);
+            std::string role_name = (binding.src.role == Role::Stick) ? "stick" : 
+                                   (binding.src.role == Role::Throttle) ? "throttle" : "rudder";
+            std::cout << "  " << role_name << " " 
+                     << (src_name ? src_name : "UNKNOWN") << "(" << binding.src.code << ") -> "
+                     << dst_name << "(" << binding.dst.code << ")";
+            if (binding.xform.invert) std::cout << " invert=1";
+            std::cout << "\n";
+        }
+    }
+    std::cout << "\n";
+    
+    // Set up epoll
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        perror("Failed to create epoll");
+        for (auto& dev : input_devices) {
+            libevdev_free(dev.dev);
+            close(dev.fd);
+        }
+        return 1;
+    }
+
+    for (auto& dev : input_devices) {
+        struct epoll_event event;
+        event.events = EPOLLIN;
+        event.data.fd = dev.fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, dev.fd, &event);
+    }
+    
+    // Rate limiting for prints
+    std::map<std::pair<std::string, int>, std::chrono::steady_clock::time_point> last_print;
+    const auto print_interval = std::chrono::milliseconds(30);
+    
+    struct epoll_event events[8];
+    
+    while (running) {
+        int nfds = epoll_wait(epoll_fd, events, 8, 100);
+        
+        if (nfds < 0) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait failed");
+            break;
+        }
+        
+        for (int i = 0; i < nfds; i++) {
+            InputDevice* source_device = nullptr;
+            for (auto& dev : input_devices) {
+                if (dev.fd == events[i].data.fd) {
+                    source_device = &dev;
+                    break;
+                }
+            }
+            
+            if (!source_device) continue;
+            
+            struct input_event ev;
+            int rc = libevdev_next_event(source_device->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+            
+            if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS) {
+                Role role = string_to_role(source_device->role);
+                PhysicalInput input{role, SrcKind::Abs, static_cast<uint16_t>(ev.code)};
+                
+                // Check if this input has a binding
+                for (const auto& binding : bindings) {
+                    if (binding.src.role == input.role && 
+                        binding.src.kind == input.kind && 
+                        binding.src.code == input.code &&
+                        binding.dst.kind == SrcKind::Abs) {
+                        
+                        auto print_key = std::make_pair(source_device->role, ev.code);
+                        auto now = std::chrono::steady_clock::now();
+                        
+                        if (now - last_print[print_key] >= print_interval) {
+                            std::string dst_name;
+                            if (binding.dst.code == ABS_RX) dst_name = "ABS_RX";
+                            else if (binding.dst.code == ABS_RY) dst_name = "ABS_RY";
+                            else if (binding.dst.code == ABS_X) dst_name = "ABS_X";
+                            else if (binding.dst.code == ABS_Y) dst_name = "ABS_Y";
+                            else dst_name = "ABS_" + std::to_string(binding.dst.code);
+                            
+                            std::string device_role_name = source_device->role;
+                            std::cout << "SRC role=" << device_role_name
+                                     << " code=" << ev.code << " val=" << ev.value
+                                     << " -> DST code=" << binding.dst.code 
+                                     << " (" << dst_name << ") val=" << ev.value << "\n";
+                            
+                            last_print[print_key] = now;
+                        }
+                        break;
+                    }
+                }
+            } else if (rc == -EAGAIN) {
+                // No data available
+            } else {
+                // Read error
+                break;
+            }
+        }
+    }
+    
+    // Clean up
+    close(epoll_fd);
+    for (auto& dev : input_devices) {
+        libevdev_free(dev.dev);
+        close(dev.fd);
+    }
+    
+    return 0;
+}
+
 void print_usage(const char* program_name) {
     std::cout << "Usage: " << program_name << " [OPTION]\n";
     std::cout << "TWCS ARMA Mapper - Virtual controller mapping for flight controls\n\n";
     std::cout << "Options:\n";
     std::cout << "  --print-map     Interactive discovery mode to map device controls\n";
     std::cout << "  --diagnostics   Non-interactive diagnostics reporting device detection, bindings, and service state\n";
+    std::cout << "  --diag-axes     Real-time axis mapping diagnostics for ARMA helicopter controls\n";
     std::cout << "  --help          Show this help message\n\n";
-    std::cout << "When run without options, the mapper starts in normal mode, creating and managing the virtual controller.\n";
+    std::cout << "When run without options, mapper starts in normal mode, creating and managing virtual controller.\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -664,6 +875,11 @@ int main(int argc, char* argv[]) {
     // Check for diagnostics mode
     if (argc >= 2 && strcmp(argv[1], "--diagnostics") == 0) {
         return diagnostics_mode(config);
+    }
+
+    // Check for diag-axes mode
+    if (argc >= 2 && strcmp(argv[1], "--diag-axes") == 0) {
+        return diag_axes_mode(config);
     }
 
     // Open and validate all devices

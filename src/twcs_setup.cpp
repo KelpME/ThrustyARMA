@@ -23,6 +23,7 @@
 #include <sys/select.h>
 #include <poll.h>
 #include <set>
+#include <filesystem>
 
 struct DeviceInfo {
     std::string path;
@@ -102,6 +103,32 @@ char get_key_with_timeout(int timeout_ms) {
         }
     }
     return 0; // timeout or no input
+}
+
+std::string get_line_input() {
+    std::string line;
+    std::getline(std::cin, line);
+    return line;
+}
+
+int get_user_choice(int max_index, int default_choice = 0) {
+    while (true) {
+        std::string input = get_line_input();
+        if (input.empty()) {
+            return default_choice;
+        }
+        
+        try {
+            int choice = std::stoi(input);
+            if (choice >= 0 && choice <= max_index) {
+                return choice;
+            }
+        } catch (...) {
+            // Invalid input
+        }
+        
+        std::cout << "Invalid choice. Please enter a number between 0 and " << max_index << ": ";
+    }
 }
 
 std::string get_udev_property(const std::string& device_path, const std::string& property) {
@@ -259,59 +286,194 @@ std::vector<DeviceInfo> detect_devices() {
     return devices;
 }
 
-void monitor_variance(DeviceInfo& device, std::chrono::milliseconds duration) {
-    auto start = std::chrono::steady_clock::now();
-    const int EPSILON = 16; // Noise gate threshold
+std::vector<DeviceInfo> build_devices_from_config_inputs(const Config& cfg) {
+    std::vector<DeviceInfo> devices;
     
-    // Initialize baseline values from current device state
+    for (const auto& input_config : cfg.inputs) {
+        if (input_config.by_id.empty()) {
+            std::cout << "Skipping " << input_config.role << " (no by_id path configured)\n";
+            continue;
+        }
+        
+        // Resolve by_id symlink to real event path
+        char real_path[PATH_MAX];
+        if (realpath(input_config.by_id.c_str(), real_path) == nullptr) {
+            std::cerr << "ERROR: Failed to resolve " << input_config.role << " path: " << input_config.by_id << "\n";
+            continue;
+        }
+        
+        // Open device
+        int fd = open(real_path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) {
+            std::cerr << "ERROR: Failed to open " << input_config.role << ": " << input_config.by_id << " (" << strerror(errno) << ")\n";
+            continue;
+        }
+        
+        // Initialize libevdev
+        struct libevdev* dev = nullptr;
+        if (libevdev_new_from_fd(fd, &dev) != 0) {
+            std::cerr << "ERROR: Failed to initialize " << input_config.role << ": " << input_config.by_id << "\n";
+            close(fd);
+            continue;
+        }
+        
+        // Create DeviceInfo from config (do NOT infer role)
+        DeviceInfo info;
+        info.path = real_path;
+        info.by_id = input_config.by_id;
+        info.fd = fd;
+        info.dev = dev;
+        
+        // Use config values first, fallback to udev if needed
+        if (!input_config.vendor.empty()) {
+            info.vendor = input_config.vendor;
+        } else {
+            info.vendor = get_udev_property(real_path, "ID_VENDOR_ID");
+        }
+        
+        if (!input_config.product.empty()) {
+            info.product = input_config.product;
+        } else {
+            info.product = get_udev_property(real_path, "ID_MODEL_ID");
+        }
+        
+        info.role = input_config.role; // Use config role, do NOT infer
+        
+        devices.push_back(info);
+        std::cout << "Configured " << input_config.role << ": " << input_config.by_id;
+        if (!info.vendor.empty() && !info.product.empty()) {
+            std::cout << " (vendor:" << info.vendor << " product:" << info.product << ")";
+        }
+        std::cout << "\n";
+    }
+    
+    return devices;
+}
+
+std::map<std::string, DeviceInfo> select_devices_per_role(const std::vector<DeviceInfo>& all_devices, const Config& cfg) {
+    std::map<std::string, DeviceInfo> selected_devices;
+    
+    // Build per-role required flag from config
+    std::map<std::string, bool> role_required;
+    for (const auto& input : cfg.inputs) {
+        role_required[input.role] = !input.optional;
+    }
+    
+    std::vector<std::string> roles_to_check = {"stick", "throttle", "rudder"};
+    
+    for (const auto& role : roles_to_check) {
+        // Find candidate devices for this role
+        std::vector<DeviceInfo> candidates;
+        for (const auto& device : all_devices) {
+            if (device.role == role) {
+                candidates.push_back(device);
+            }
+        }
+        
+        if (candidates.empty()) {
+            bool required = role_required[role];
+            if (required) {
+                std::cerr << "ERROR: No " << role << " devices found! This device is required by config.\n";
+                return {};
+            } else {
+                std::cout << "No " << role << " devices found (optional according to config).\n";
+                continue;
+            }
+        }
+        
+        std::cout << "\nSelect " << role << " device:\n";
+        for (size_t i = 0; i < candidates.size(); i++) {
+            const auto& device = candidates[i];
+            std::cout << "  [" << i << "] " << device.by_id;
+            if (!device.vendor.empty() && !device.product.empty()) {
+                std::cout << " (vendor:" << device.vendor << " product:" << device.product << ")";
+            }
+            std::cout << "\n";
+        }
+        
+        if (candidates.size() == 1) {
+            std::cout << "Enter choice [0-0] (default 0): ";
+        } else {
+            std::cout << "Enter choice [0-" << (candidates.size() - 1) << "] (default 0): ";
+        }
+        int choice = get_user_choice(static_cast<int>(candidates.size() - 1), 0);
+        
+        selected_devices[role] = candidates[choice];
+        std::cout << "Selected: " << selected_devices[role].by_id << "\n";
+    }
+    
+    return selected_devices;
+}
+
+int capture_single_axis(DeviceInfo& device, int capture_time_ms = 1500) {
+    const int JITTER_THRESHOLD = 32;
+    std::map<int, int> delta_sum;
+    
+    // Drain pending events first
+    struct input_event ev;
+    while (libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
+        // Just drain the queue
+    }
+    
+    // Get initial values as baseline
+    std::map<int, int> baseline_values;
     for (int code = 0; code <= ABS_MAX; code++) {
         if (libevdev_has_event_code(device.dev, EV_ABS, code)) {
             const struct input_absinfo* absinfo = libevdev_get_abs_info(device.dev, code);
             if (absinfo) {
-                device.abs_values[code] = absinfo->value;
-                device.abs_variance[code] = 0;
+                baseline_values[code] = absinfo->value;
+                delta_sum[code] = 0;
             }
         }
     }
     
-    device.last_update = std::chrono::steady_clock::now();
+    auto start = std::chrono::steady_clock::now();
     
-    while (std::chrono::steady_clock::now() - start < duration) {
-        struct input_event ev;
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(capture_time_ms)) {
         int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
         
         if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS) {
-            int current = ev.value;
-            int baseline = device.abs_values[ev.code];
-            int delta = std::abs(current - baseline);
+            int baseline = baseline_values[ev.code];
+            int delta = std::abs(ev.value - baseline);
             
-            // Apply noise gating: only count movement if delta exceeds epsilon
-            if (delta >= EPSILON) {
-                device.abs_variance[ev.code] = std::max(device.abs_variance[ev.code], delta);
-                device.last_update = std::chrono::steady_clock::now();
+            if (delta >= JITTER_THRESHOLD) {
+                delta_sum[ev.code] += delta;
             }
         } else if (rc == -EAGAIN) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
+    
+    // Find axis with highest delta
+    int best_code = -1;
+    int max_delta = 0;
+    for (const auto& [code, delta] : delta_sum) {
+        if (delta > max_delta) {
+            max_delta = delta;
+            best_code = code;
+        }
+    }
+    
+    return best_code;
+}
+
+bool get_invert_preference(const std::string& axis_name) {
+    std::cout << "Invert " << axis_name << "? (y/n, default n): ";
+    std::string input = get_line_input();
+    return (!input.empty() && (input[0] == 'y' || input[0] == 'Y'));
 }
 
 void capture_axes(CaptureState& state) {
-    // Phase 1A: Stick axes (5 seconds)
-    std::cout << "\n=== Phase 1: Axis Capture ===\n";
-    std::cout << "Move the STICK left/right and up/down (5 seconds)\n";
-    std::cout << "Starting in 3... ";
-    std::cout.flush();
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    std::cout << "2... ";
-    std::cout.flush();
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    std::cout << "1... ";
-    std::cout.flush();
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    std::cout << "GO!\n";
+    std::cout << "\n=== Axis Capture ===\n";
+    std::cout << "This will capture axes one at a time for precise mapping.\n\n";
     
-    // Find stick device
+    // CYCLIC X (right stick X -> ABS_RX)
+    if (state.devices.empty()) {
+        std::cerr << "No devices available for axis capture!\n";
+        return;
+    }
+    
+    // Find stick device for cyclic controls
     DeviceInfo* stick = nullptr;
     for (auto& device : state.devices) {
         if (device.role == "stick") {
@@ -320,41 +482,57 @@ void capture_axes(CaptureState& state) {
         }
     }
     
-    if (stick) {
-        monitor_variance(*stick, std::chrono::seconds(5));
-        
-        // Find top 2 axes with highest variance
-        std::vector<std::pair<int, int>> axis_variance;
-        for (const auto& [code, variance] : stick->abs_variance) {
-            if (variance > 0) {
-                axis_variance.push_back({code, variance});
-            }
-        }
-        
-        std::sort(axis_variance.begin(), axis_variance.end(), 
-                 [](const auto& a, const auto& b) { return a.second > b.second; });
-        
-        if (axis_variance.size() >= 2) {
-            state.captured_axes.push_back(CapturedAxis{"stick", axis_variance[0].first, ABS_X, false, 0, 1.0f});
-            state.captured_axes.push_back(CapturedAxis{"stick", axis_variance[1].first, ABS_Y, false, 0, 1.0f});
-            std::cout << "Captured X axis: " << axis_variance[0].first << " (variance: " << axis_variance[0].second << ")\n";
-            std::cout << "Captured Y axis: " << axis_variance[1].first << " (variance: " << axis_variance[1].second << ")\n";
-        }
-        
-        // Check for HAT
-        bool has_hat_x = stick->abs_variance.count(ABS_HAT0X) && stick->abs_variance.at(ABS_HAT0X) > 0;
-        bool has_hat_y = stick->abs_variance.count(ABS_HAT0Y) && stick->abs_variance.at(ABS_HAT0Y) > 0;
-        if (has_hat_x) {
-            state.captured_axes.push_back(CapturedAxis{"stick", ABS_HAT0X, ABS_HAT0X, false, 0, 1.0f});
-            std::cout << "Captured HAT X axis\n";
-        }
-        if (has_hat_y) {
-            state.captured_axes.push_back(CapturedAxis{"stick", ABS_HAT0Y, ABS_HAT0Y, false, 0, 1.0f});
-            std::cout << "Captured HAT Y axis\n";
+    if (!stick) {
+        std::cerr << "ERROR: No stick device found for cyclic controls!\n";
+        return;
+    }
+    
+    // Capture CYCLIC X
+    std::cout << "A) CYCLIC X (right stick X axis)\n";
+    std::cout << "Press ENTER and move stick left/right...";
+    get_line_input();
+    
+    int cyclic_x_code = capture_single_axis(*stick);
+    if (cyclic_x_code >= 0) {
+        bool invert = get_invert_preference("Cyclic X");
+        state.captured_axes.push_back(CapturedAxis{"stick", cyclic_x_code, ABS_RX, invert, 0, 1.0f});
+        std::cout << "Captured CYCLIC X: code " << cyclic_x_code << " -> virtual ABS_RX(3) invert=" << invert << "\n\n";
+    } else {
+        std::cout << "No movement detected. Retrying...\n";
+        // Retry once
+        std::cout << "Press ENTER and move stick left/right...";
+        get_line_input();
+        cyclic_x_code = capture_single_axis(*stick);
+        if (cyclic_x_code >= 0) {
+            bool invert = get_invert_preference("Cyclic X");
+            state.captured_axes.push_back(CapturedAxis{"stick", cyclic_x_code, ABS_RX, invert, 0, 1.0f});
+            std::cout << "Captured CYCLIC X: code " << cyclic_x_code << " -> virtual ABS_RX(3) invert=" << invert << "\n\n";
         }
     }
     
-    // Phase 1B: Throttle axis (4 seconds, if present)
+    // Capture CYCLIC Y
+    std::cout << "B) CYCLIC Y (right stick Y axis)\n";
+    std::cout << "Press ENTER and move stick forward/back...";
+    get_line_input();
+    
+    int cyclic_y_code = capture_single_axis(*stick);
+    if (cyclic_y_code >= 0) {
+        bool invert = get_invert_preference("Cyclic Y");
+        state.captured_axes.push_back(CapturedAxis{"stick", cyclic_y_code, ABS_RY, invert, 0, 1.0f});
+        std::cout << "Captured CYCLIC Y: code " << cyclic_y_code << " -> virtual ABS_RY(4) invert=" << invert << "\n\n";
+    } else {
+        std::cout << "No movement detected. Retrying...\n";
+        std::cout << "Press ENTER and move stick forward/back...";
+        get_line_input();
+        cyclic_y_code = capture_single_axis(*stick);
+        if (cyclic_y_code >= 0) {
+            bool invert = get_invert_preference("Cyclic Y");
+            state.captured_axes.push_back(CapturedAxis{"stick", cyclic_y_code, ABS_RY, invert, 0, 1.0f});
+            std::cout << "Captured CYCLIC Y: code " << cyclic_y_code << " -> virtual ABS_RY(4) invert=" << invert << "\n\n";
+        }
+    }
+    
+    // Capture COLLECTIVE (left stick Y -> ABS_Y)
     DeviceInfo* throttle = nullptr;
     for (auto& device : state.devices) {
         if (device.role == "throttle") {
@@ -364,33 +542,31 @@ void capture_axes(CaptureState& state) {
     }
     
     if (throttle) {
-        std::cout << "\nMove the THROTTLE through its full range (4 seconds)\n";
-        std::cout << "Starting in 2... ";
-        std::cout.flush();
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        std::cout << "GO!\n";
+        std::cout << "C) COLLECTIVE (throttle/collective)\n";
+        std::cout << "Press ENTER and move throttle through full range...";
+        get_line_input();
         
-        monitor_variance(*throttle, std::chrono::seconds(4));
-        
-        // Find axis with highest variance, prefer ABS_Z/ABS_THROTTLE
-        std::vector<std::pair<int, int>> axis_variance;
-        for (const auto& [code, variance] : throttle->abs_variance) {
-            if (variance > 0) {
-                int priority = (code == ABS_Z || code == ABS_THROTTLE) ? 1000 : 0;
-                axis_variance.push_back({code, variance + priority});
+        int collective_code = capture_single_axis(*throttle);
+        if (collective_code >= 0) {
+            bool invert = get_invert_preference("Collective");
+            state.captured_axes.push_back(CapturedAxis{"throttle", collective_code, ABS_Y, invert, 0, 1.0f});
+            std::cout << "Captured COLLECTIVE: code " << collective_code << " -> virtual ABS_Y(1) invert=" << invert << "\n\n";
+        } else {
+            std::cout << "No movement detected. Retrying...\n";
+            std::cout << "Press ENTER and move throttle through full range...";
+            get_line_input();
+            collective_code = capture_single_axis(*throttle);
+            if (collective_code >= 0) {
+                bool invert = get_invert_preference("Collective");
+                state.captured_axes.push_back(CapturedAxis{"throttle", collective_code, ABS_Y, invert, 0, 1.0f});
+                std::cout << "Captured COLLECTIVE: code " << collective_code << " -> virtual ABS_Y(1) invert=" << invert << "\n\n";
             }
         }
-        
-        std::sort(axis_variance.begin(), axis_variance.end(), 
-                 [](const auto& a, const auto& b) { return a.second > b.second; });
-        
-        if (!axis_variance.empty()) {
-            state.captured_axes.push_back(CapturedAxis{"throttle", axis_variance[0].first, ABS_Z, false, 0, 1.0f});
-            std::cout << "Captured throttle axis: " << axis_variance[0].first << " (variance: " << (axis_variance[0].second % 1000) << ")\n";
-        }
+    } else {
+        std::cout << "C) COLLECTIVE - no throttle device found, skipping\n\n";
     }
     
-    // Phase 1C: Rudder axis (3 seconds, if present)
+    // Capture ANTI-TORQUE (left stick X -> ABS_X)
     DeviceInfo* rudder = nullptr;
     for (auto& device : state.devices) {
         if (device.role == "rudder") {
@@ -400,30 +576,28 @@ void capture_axes(CaptureState& state) {
     }
     
     if (rudder) {
-        std::cout << "\nMove the RUDDER pedals (3 seconds)\n";
-        std::cout << "Starting in 2... ";
-        std::cout.flush();
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        std::cout << "GO!\n";
+        std::cout << "D) ANTI-TORQUE (rudder pedals)\n";
+        std::cout << "Press ENTER and move rudder pedals left/right...";
+        get_line_input();
         
-        monitor_variance(*rudder, std::chrono::seconds(3));
-        
-        // Find axis with highest variance, prefer ABS_RZ
-        std::vector<std::pair<int, int>> axis_variance;
-        for (const auto& [code, variance] : rudder->abs_variance) {
-            if (variance > 0) {
-                int priority = (code == ABS_RZ) ? 1000 : 0;
-                axis_variance.push_back({code, variance + priority});
+        int antitorque_code = capture_single_axis(*rudder);
+        if (antitorque_code >= 0) {
+            bool invert = get_invert_preference("Anti-torque");
+            state.captured_axes.push_back(CapturedAxis{"rudder", antitorque_code, ABS_X, invert, 0, 1.0f});
+            std::cout << "Captured ANTI-TORQUE: code " << antitorque_code << " -> virtual ABS_X(0) invert=" << invert << "\n\n";
+        } else {
+            std::cout << "No movement detected. Retrying...\n";
+            std::cout << "Press ENTER and move rudder pedals left/right...";
+            get_line_input();
+            antitorque_code = capture_single_axis(*rudder);
+            if (antitorque_code >= 0) {
+                bool invert = get_invert_preference("Anti-torque");
+                state.captured_axes.push_back(CapturedAxis{"rudder", antitorque_code, ABS_X, invert, 0, 1.0f});
+                std::cout << "Captured ANTI-TORQUE: code " << antitorque_code << " -> virtual ABS_X(0) invert=" << invert << "\n\n";
             }
         }
-        
-        std::sort(axis_variance.begin(), axis_variance.end(), 
-                 [](const auto& a, const auto& b) { return a.second > b.second; });
-        
-        if (!axis_variance.empty()) {
-            state.captured_axes.push_back(CapturedAxis{"rudder", axis_variance[0].first, ABS_RZ, false, 0, 1.0f});
-            std::cout << "Captured rudder axis: " << axis_variance[0].first << " (variance: " << (axis_variance[0].second % 1000) << ")\n";
-        }
+    } else {
+        std::cout << "D) ANTI-TORQUE - no rudder device found, skipping\n\n";
     }
 }
 
@@ -520,21 +694,14 @@ void capture_buttons(CaptureState& state) {
     std::cout << "\nCaptured " << state.captured_buttons.size() << " out of " << VIRTUAL_BUTTONS.size() << " buttons\n";
 }
 
-bool write_config(const CaptureState& state) {
+bool write_config(const CaptureState& state, const Config& existing_config) {
     std::string config_dir = std::string(getenv("HOME")) + "/.config/twcs-mapper";
     std::string config_path = config_dir + "/config.json";
     
-    // Load existing config to preserve non-binding settings
-    Config config;
-    auto existing = ConfigManager::load(config_path);
-    if (existing) {
-        config = *existing;
-    } else {
-        // Use default uinput_name for fresh config
-        config.uinput_name = "Xbox 360 Controller (Virtual)";
-    }
+    // Use existing config and only update what's necessary
+    Config config = existing_config;
     
-    // Update inputs
+    // Update inputs based on selected devices
     config.inputs.clear();
     for (const auto& device : state.devices) {
         InputConfig input;
@@ -612,8 +779,8 @@ bool install_service() {
 }
 
 void print_summary(const CaptureState& state) {
-    std::cout << "\n=== Phase 3: Confirmation ===\n";
-    std::cout << "Detected devices:\n";
+    std::cout << "\n=== Confirmation ===\n";
+    std::cout << "Selected devices:\n";
     for (const auto& device : state.devices) {
         std::cout << "  " << device.role << ": " << device.by_id;
         if (!device.vendor.empty() && !device.product.empty()) {
@@ -622,45 +789,130 @@ void print_summary(const CaptureState& state) {
         std::cout << "\n";
     }
     
-    std::cout << "\nCaptured " << state.captured_axes.size() << " axis bindings\n";
+    std::cout << "\nARMA Helicopter Axis Mappings:\n";
     for (const auto& axis : state.captured_axes) {
-        std::cout << "  " << axis.role << " " << axis.src << " -> virtual " << axis.dst << "\n";
+        std::string dst_name;
+        if (axis.dst == ABS_RX) dst_name = "ABS_RX (Cyclic X - right stick X)";
+        else if (axis.dst == ABS_RY) dst_name = "ABS_RY (Cyclic Y - right stick Y)";
+        else if (axis.dst == ABS_X) dst_name = "ABS_X (Anti-torque - left stick X)";
+        else if (axis.dst == ABS_Y) dst_name = "ABS_Y (Collective - left stick Y)";
+        else dst_name = "ABS_" + std::to_string(axis.dst);
+        
+        std::cout << "  " << axis.role << " code " << axis.src 
+                 << " -> " << dst_name;
+        if (axis.invert) std::cout << " [INVERTED]";
+        std::cout << "\n";
     }
     
     std::cout << "\nCaptured " << state.captured_buttons.size() << " button bindings\n";
-    for (size_t i = 0; i < state.captured_buttons.size(); i++) {
+    for (size_t i = 0; i < state.captured_buttons.size() && i < BUTTON_NAMES.size(); i++) {
         std::cout << "  " << state.captured_buttons[i].first << " " << state.captured_buttons[i].second 
                  << " -> " << BUTTON_NAMES[i] << "\n";
     }
 }
 
 int main() {
-    std::cout << "=== TWCS Quick Setup (30 seconds) ===\n";
-    std::cout << "This will automatically detect your devices and configure them.\n\n";
+    std::cout << "=== TWCS ARMA Setup ===\n";
+    std::cout << "This will help you select devices and capture controls for ARMA helicopter mapping.\n\n";
     
     CaptureState state;
     
-    // Phase 0: Device Detection
-    std::cout << "Phase 0: Detecting devices...\n";
-    state.devices = detect_devices();
+    // Phase 0: Load Config and Handle Reset
+    std::string config_dir = std::string(getenv("HOME")) + "/.config/twcs-mapper";
+    std::string config_path = config_dir + "/config.json";
     
-    if (state.devices.empty()) {
-        std::cerr << "Error: No joystick devices found!\n";
+    Config config;
+    auto config_opt = ConfigManager::load(config_path);
+    
+    if (config_opt) {
+        std::cout << "Existing config detected at " << config_path << "\n";
+        std::cout << "Delete and regenerate? [y/N]: ";
+        std::string resp;
+        std::getline(std::cin, resp);
+        bool should_delete = !resp.empty() && (resp[0] == 'y' || resp[0] == 'Y');
+        
+        if (should_delete) {
+            if (std::filesystem::remove(config_path)) {
+                std::cout << "Config deleted\n";
+                config_opt = std::nullopt;
+            } else {
+                std::cerr << "Failed to delete config file\n";
+            }
+        }
+    }
+    
+    if (!config_opt) {
+        std::cout << "Creating new setup...\n";
+        config.uinput_name = "Thrustmaster ARMA Virtual";
+        config.grab = true;
+    } else {
+        config = *config_opt;
+        std::cout << "Using existing config\n";
+    }
+    
+    std::vector<DeviceInfo> all_devices;
+    
+    // Try config-driven device building first
+    if (!config.inputs.empty()) {
+        std::cout << "\nPhase 0: Building devices from config...\n";
+        all_devices = build_devices_from_config_inputs(config);
+    }
+    
+    // Fallback to heuristic scanning if no config devices
+    if (all_devices.empty()) {
+        std::cout << "\nPhase 0: No valid config devices, scanning all devices...\n";
+        all_devices = detect_devices();
+    }
+    
+    if (all_devices.empty()) {
+        std::cerr << "Error: No joystick devices available!\n";
         return 1;
     }
     
-    std::cout << "Found " << state.devices.size() << " devices:\n";
-    for (const auto& device : state.devices) {
-        std::cout << "  " << device.role << ": " << device.by_id << "\n";
+    std::cout << "\nAvailable devices for selection:\n";
+    for (const auto& device : all_devices) {
+        std::cout << "  " << device.role << ": " << device.by_id;
+        if (!device.vendor.empty() && !device.product.empty()) {
+            std::cout << " (vendor:" << device.vendor << " product:" << device.product << ")";
+        }
+        std::cout << "\n";
     }
     
-    // Phase 1: Axis Capture
+    // Phase 1: Device Selection per role
+    std::cout << "\nPhase 1: Device Selection\n";
+    auto selected_devices = select_devices_per_role(all_devices, config);
+    
+    if (selected_devices.empty()) {
+        std::cerr << "ERROR: Required device(s) not selected!\n";
+        return 1;
+    }
+    
+    // Close and free unselected devices to avoid resource leaks
+    std::set<std::string> selected_roles;
+    for (const auto& [role, device] : selected_devices) {
+        selected_roles.insert(role);
+    }
+    
+    for (auto& device : all_devices) {
+        if (selected_roles.find(device.role) == selected_roles.end()) {
+            std::cout << "Closing unselected " << device.role << ": " << device.by_id << "\n";
+            libevdev_free(device.dev);
+            close(device.fd);
+        }
+    }
+    
+    // Convert selected devices to state.devices format
+    for (const auto& [role, device] : selected_devices) {
+        state.devices.push_back(device);
+    }
+    
+    // Phase 2: Axis Capture
     capture_axes(state);
     
-    // Phase 2: Button Capture
+    // Phase 3: Button Capture
     capture_buttons(state);
     
-    // Phase 3: Confirmation with redo loop
+    // Phase 4: Confirmation with redo loop
     while (true) {
         print_summary(state);
         
@@ -699,9 +951,9 @@ int main() {
         }
     }
     
-    // Phase 4: Config Write
-    std::cout << "\n=== Phase 4: Writing Configuration ===\n";
-    if (!write_config(state)) {
+// Phase 5: Config Write
+    std::cout << "\n=== Phase 5: Writing Configuration ===\n";
+    if (!write_config(state, config)) {
         std::cerr << "Error: Failed to write config file!\n";
         return 1;
     }
@@ -723,7 +975,11 @@ int main() {
     std::cout << "\nLast 10 journal lines:\n";
     system("journalctl --user -u twcs-mapper.service -n 10 --no-pager");
     
-    std::cout << "\n✓ Setup complete! ARMA should now see one virtual Xbox controller.\n";
+    std::cout << "\n✓ Setup complete! ARMA should now see 'Thrustmaster ARMA Virtual' controller.\n";
+    std::cout << "\nExpected ARMA helicopter behavior:\n";
+    std::cout << "  - Physical stick X/Y -> Right stick (cyclic)\n";
+    std::cout << "  - Physical rudder -> Left stick X (anti-torque)\n";
+    std::cout << "  - Physical throttle -> Left stick Y (collective)\n";
     
     return 0;
 }
