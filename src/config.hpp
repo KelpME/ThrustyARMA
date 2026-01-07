@@ -11,6 +11,7 @@ struct InputConfig {
     std::string vendor;
     std::string product;
     bool optional;
+    int bit_depth = 0;  // 0 = auto-detect, 8/10/14/16 = explicit bit depth
 };
 
 struct BindingConfigKey {

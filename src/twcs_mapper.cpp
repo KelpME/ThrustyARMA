@@ -1,5 +1,7 @@
 #include "config.hpp"
 #include "bindings.hpp"
+#include "virtual_device.hpp"
+#include "epoll_loop.hpp"
 #include <linux/input.h>
 #include <linux/input-event-codes.h>
 #include <linux/uinput.h>
@@ -613,9 +615,11 @@ int diagnostics_mode(const Config& config) {
 }
 
 int diag_axes_mode(const Config& config) {
-    std::cout << "=== TWCS ARMA Axis Diagnostics ===\n";
-    std::cout << "Showing real-time axis mappings for ARMA helicopter controls.\n";
+    std::cout << "=== TWCS ARMA Live Input Monitor ===\n";
+    std::cout << "Showing real-time input mappings with physical device names.\n";
     std::cout << "Press Ctrl+C to stop.\n\n";
+    std::cout << "NOTE: Stop the mapper service first if devices are grabbed:\n";
+    std::cout << "  systemctl --user stop twcs-mapper.service\n\n";
     
     // Open and validate all devices
     std::vector<InputDevice> input_devices;
@@ -668,7 +672,9 @@ int diag_axes_mode(const Config& config) {
         device.last_reconnect_attempt = std::chrono::steady_clock::now();
         input_devices.push_back(device);
         
-        std::cout << "Opened " << input_config.role << ": " << input_config.by_id << "\n";
+        const char* device_name = libevdev_get_name(dev);
+        std::cout << "Opened " << input_config.role << ": " << (device_name ? device_name : "UNKNOWN") << "\n";
+        std::cout << "  Path: " << input_config.by_id << "\n";
     }
     
     if (input_devices.empty()) {
@@ -700,28 +706,99 @@ int diag_axes_mode(const Config& config) {
     validate_and_filter_bindings(bindings, input_devices);
     BindingResolver resolver(bindings);
     
-    // Print active bindings
-    std::cout << "\nActive ARMA helicopter axis bindings:\n";
+    // Apply bit depth overrides from config
+    for (const auto& input_config : config.inputs) {
+        Role role;
+        if (input_config.role == "stick") role = Role::Stick;
+        else if (input_config.role == "throttle") role = Role::Throttle;
+        else if (input_config.role == "rudder") role = Role::Rudder;
+        else continue;
+        
+        if (input_config.bit_depth > 0) {
+            resolver.set_bit_depth(role, input_config.bit_depth);
+        }
+    }
+    
+    // Print active bindings with device-specific names
+    std::cout << "\n=== Active Input Mappings ===\n";
+    std::cout << "\nAxis Bindings:\n";
     for (const auto& binding : bindings) {
         if (binding.dst.kind == SrcKind::Abs) {
+            // Find the device for this binding
+            std::string device_name = "UNKNOWN";
+            for (const auto& device : input_devices) {
+                std::string dev_role = device.role;
+                std::string binding_role = (binding.src.role == Role::Stick) ? "stick" : 
+                                          (binding.src.role == Role::Throttle) ? "throttle" : "rudder";
+                if (dev_role == binding_role) {
+                    const char* name = libevdev_get_name(device.dev);
+                    if (name) device_name = name;
+                    break;
+                }
+            }
+            
             std::string dst_name;
-            if (binding.dst.code == ABS_RX) dst_name = "ABS_RX (Cyclic X)";
-            else if (binding.dst.code == ABS_RY) dst_name = "ABS_RY (Cyclic Y)";
-            else if (binding.dst.code == ABS_X) dst_name = "ABS_X (Anti-torque)";
-            else if (binding.dst.code == ABS_Y) dst_name = "ABS_Y (Collective)";
+            if (binding.dst.code == ABS_RX) dst_name = "Right Stick X (Cyclic Roll)";
+            else if (binding.dst.code == ABS_RY) dst_name = "Right Stick Y (Cyclic Pitch)";
+            else if (binding.dst.code == ABS_X) dst_name = "Left Stick X (Anti-torque/Yaw)";
+            else if (binding.dst.code == ABS_Y) dst_name = "Left Stick Y (Collective)";
+            else if (binding.dst.code == ABS_Z) dst_name = "Left Trigger";
+            else if (binding.dst.code == ABS_RZ) dst_name = "Right Trigger";
             else dst_name = "ABS_" + std::to_string(binding.dst.code);
             
             const char* src_name = libevdev_event_code_get_name(EV_ABS, binding.src.code);
             std::string role_name = (binding.src.role == Role::Stick) ? "stick" : 
                                    (binding.src.role == Role::Throttle) ? "throttle" : "rudder";
-            std::cout << "  " << role_name << " " 
-                     << (src_name ? src_name : "UNKNOWN") << "(" << binding.src.code << ") -> "
-                     << dst_name << "(" << binding.dst.code << ")";
-            if (binding.xform.invert) std::cout << " invert=1";
+            std::cout << "  [" << device_name << "] " 
+                     << (src_name ? src_name : "UNKNOWN") << " -> "
+                     << dst_name;
+            if (binding.xform.invert) std::cout << " [INVERTED]";
+            if (binding.xform.scale != 1.0f) std::cout << " [scale=" << binding.xform.scale << "]";
             std::cout << "\n";
         }
     }
-    std::cout << "\n";
+    
+    std::cout << "\nButton Bindings:\n";
+    for (const auto& binding : bindings) {
+        if (binding.dst.kind == SrcKind::Key) {
+            // Find the device for this binding
+            std::string device_name = "UNKNOWN";
+            for (const auto& device : input_devices) {
+                std::string dev_role = device.role;
+                std::string binding_role = (binding.src.role == Role::Stick) ? "stick" : 
+                                          (binding.src.role == Role::Throttle) ? "throttle" : "rudder";
+                if (dev_role == binding_role) {
+                    const char* name = libevdev_get_name(device.dev);
+                    if (name) device_name = name;
+                    break;
+                }
+            }
+            
+            const char* src_name = libevdev_event_code_get_name(EV_KEY, binding.src.code);
+            const char* dst_name = libevdev_event_code_get_name(EV_KEY, binding.dst.code);
+            
+            // Map virtual button codes to Xbox controller names
+            std::string virtual_button_name;
+            if (binding.dst.code == BTN_SOUTH) virtual_button_name = "A Button";
+            else if (binding.dst.code == BTN_EAST) virtual_button_name = "B Button";
+            else if (binding.dst.code == BTN_WEST) virtual_button_name = "X Button";
+            else if (binding.dst.code == BTN_NORTH) virtual_button_name = "Y Button";
+            else if (binding.dst.code == BTN_TL) virtual_button_name = "Left Bumper";
+            else if (binding.dst.code == BTN_TR) virtual_button_name = "Right Bumper";
+            else if (binding.dst.code == BTN_SELECT) virtual_button_name = "Back/Select";
+            else if (binding.dst.code == BTN_START) virtual_button_name = "Start";
+            else if (binding.dst.code == BTN_MODE) virtual_button_name = "Guide/Home";
+            else if (binding.dst.code == BTN_THUMBL) virtual_button_name = "Left Stick Click";
+            else if (binding.dst.code == BTN_THUMBR) virtual_button_name = "Right Stick Click";
+            else virtual_button_name = dst_name ? dst_name : "UNKNOWN";
+            
+            std::cout << "  [" << device_name << "] " 
+                     << (src_name ? src_name : "UNKNOWN") << " -> "
+                     << virtual_button_name << "\n";
+        }
+    }
+    std::cout << "\n=== Live Input Stream ===\n";
+    std::cout << "Move controls or press buttons to see activity...\n\n";
     
     // Set up epoll
     int epoll_fd = epoll_create1(0);
@@ -770,38 +847,108 @@ int diag_axes_mode(const Config& config) {
             struct input_event ev;
             int rc = libevdev_next_event(source_device->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
             
-            if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS) {
+            if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
                 Role role = string_to_role(source_device->role);
-                PhysicalInput input{role, SrcKind::Abs, static_cast<uint16_t>(ev.code)};
                 
-                // Check if this input has a binding
-                for (const auto& binding : bindings) {
-                    if (binding.src.role == input.role && 
-                        binding.src.kind == input.kind && 
-                        binding.src.code == input.code &&
-                        binding.dst.kind == SrcKind::Abs) {
-                        
-                        auto print_key = std::make_pair(source_device->role, ev.code);
-                        auto now = std::chrono::steady_clock::now();
-                        
-                        if (now - last_print[print_key] >= print_interval) {
-                            std::string dst_name;
-                            if (binding.dst.code == ABS_RX) dst_name = "ABS_RX";
-                            else if (binding.dst.code == ABS_RY) dst_name = "ABS_RY";
-                            else if (binding.dst.code == ABS_X) dst_name = "ABS_X";
-                            else if (binding.dst.code == ABS_Y) dst_name = "ABS_Y";
-                            else dst_name = "ABS_" + std::to_string(binding.dst.code);
+                // Handle axis events
+                if (ev.type == EV_ABS) {
+                    PhysicalInput input{role, SrcKind::Abs, static_cast<uint16_t>(ev.code)};
+                    
+                    // Check if this input has a binding
+                    for (const auto& binding : bindings) {
+                        if (binding.src.role == input.role && 
+                            binding.src.kind == input.kind && 
+                            binding.src.code == input.code &&
+                            binding.dst.kind == SrcKind::Abs) {
                             
-                            std::string device_role_name = source_device->role;
-                            std::cout << "SRC role=" << device_role_name
-                                     << " code=" << ev.code << " val=" << ev.value
-                                     << " -> DST code=" << binding.dst.code 
-                                     << " (" << dst_name << ") val=" << ev.value << "\n";
+                            auto print_key = std::make_pair(source_device->role, ev.code);
+                            auto now = std::chrono::steady_clock::now();
                             
-                            last_print[print_key] = now;
+                            if (now - last_print[print_key] >= print_interval) {
+                                // Apply transform to show output value
+                                Role role = string_to_role(source_device->role);
+                                int transformed = resolver.apply_axis_transform(ev.value, binding.xform, role);
+                                
+                                const char* device_name = libevdev_get_name(source_device->dev);
+                                const char* src_name = libevdev_event_code_get_name(EV_ABS, ev.code);
+                                std::string dst_name;
+                                if (binding.dst.code == ABS_RX) dst_name = "Right Stick X (Cyclic Roll)";
+                                else if (binding.dst.code == ABS_RY) dst_name = "Right Stick Y (Cyclic Pitch)";
+                                else if (binding.dst.code == ABS_X) dst_name = "Left Stick X (Anti-torque)";
+                                else if (binding.dst.code == ABS_Y) dst_name = "Left Stick Y (Collective)";
+                                else dst_name = "ABS_" + std::to_string(binding.dst.code);
+                                
+                                std::cout << "[" << (device_name ? device_name : source_device->role) << "] "
+                                         << (src_name ? src_name : "UNKNOWN")
+                                         << " (raw=" << ev.value << ") -> "
+                                         << dst_name << " (out=" << transformed << ")\n";
+                                std::cout.flush();
+                                
+                                last_print[print_key] = now;
+                            }
+                            break;
                         }
-                        break;
                     }
+                }
+                // Handle button events
+                else if (ev.type == EV_KEY) {
+                    PhysicalInput input{role, SrcKind::Key, static_cast<uint16_t>(ev.code)};
+                    
+                    const char* device_name = libevdev_get_name(source_device->dev);
+                    const char* src_name = libevdev_event_code_get_name(EV_KEY, ev.code);
+                    
+                    // Show button name or code if unknown
+                    std::string src_button;
+                    if (src_name) {
+                        src_button = src_name;
+                    } else {
+                        src_button = "BTN_CODE_" + std::to_string(ev.code);
+                    }
+                    
+                    // Check if this button has a binding
+                    bool has_binding = false;
+                    std::string virtual_button_name;
+                    
+                    for (const auto& binding : bindings) {
+                        if (binding.src.role == input.role && 
+                            binding.src.kind == input.kind && 
+                            binding.src.code == input.code &&
+                            binding.dst.kind == SrcKind::Key) {
+                            
+                            has_binding = true;
+                            
+                            // Map virtual button codes to Xbox controller names
+                            if (binding.dst.code == BTN_SOUTH) virtual_button_name = "A Button";
+                            else if (binding.dst.code == BTN_EAST) virtual_button_name = "B Button";
+                            else if (binding.dst.code == BTN_WEST) virtual_button_name = "X Button";
+                            else if (binding.dst.code == BTN_NORTH) virtual_button_name = "Y Button";
+                            else if (binding.dst.code == BTN_TL) virtual_button_name = "Left Bumper";
+                            else if (binding.dst.code == BTN_TR) virtual_button_name = "Right Bumper";
+                            else if (binding.dst.code == BTN_SELECT) virtual_button_name = "Back/Select";
+                            else if (binding.dst.code == BTN_START) virtual_button_name = "Start";
+                            else if (binding.dst.code == BTN_MODE) virtual_button_name = "Guide/Home";
+                            else if (binding.dst.code == BTN_THUMBL) virtual_button_name = "Left Stick Click";
+                            else if (binding.dst.code == BTN_THUMBR) virtual_button_name = "Right Stick Click";
+                            else {
+                                const char* dst_name = libevdev_event_code_get_name(EV_KEY, binding.dst.code);
+                                virtual_button_name = dst_name ? dst_name : ("BTN_CODE_" + std::to_string(binding.dst.code));
+                            }
+                            break;
+                        }
+                    }
+                    
+                    // Display button press/release
+                    std::cout << "[" << (device_name ? device_name : source_device->role) << "] "
+                             << src_button;
+                    
+                    if (has_binding) {
+                        std::cout << " -> " << virtual_button_name;
+                    } else {
+                        std::cout << " -> [UNMAPPED]";
+                    }
+                    
+                    std::cout << " [" << (ev.value ? "PRESSED" : "RELEASED") << "]\n";
+                    std::cout.flush();
                 }
             } else if (rc == -EAGAIN) {
                 // No data available
@@ -968,104 +1115,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Create uinput device
-    int uinput_fd = open("/dev/uinput", O_RDWR | O_NONBLOCK);
-    if (uinput_fd < 0) {
-        perror("Failed to open uinput device");
+// Create virtual device
+    VirtualDevice virtual_device(config.uinput_name);
+    if (!virtual_device.initialize()) {
         for (auto& dev : input_devices) {
-            libevdev_free(dev.dev);
-            close(dev.fd);
-        }
-        return 1;
-    }
-
-    // Enable event types
-    if (ioctl(uinput_fd, UI_SET_EVBIT, EV_KEY) < 0 ||
-        ioctl(uinput_fd, UI_SET_EVBIT, EV_ABS) < 0) {
-        perror("Failed to enable event types");
-        close(uinput_fd);
-        for (auto& dev : input_devices) {
-            libevdev_free(dev.dev);
-            close(dev.fd);
-        }
-        return 1;
-    }
-
-    // Virtual Controller Contract: Fixed 11 buttons for ARMA stability
-    const int virtual_buttons[] = {
-        BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH,  // Face buttons
-        BTN_TL, BTN_TR,                              // Shoulder buttons (no digital triggers)
-        BTN_SELECT, BTN_START, BTN_MODE,             // System buttons
-        BTN_THUMBL, BTN_THUMBR                       // Stick clicks
-    };
-    for (int btn : virtual_buttons) {
-        if (ioctl(uinput_fd, UI_SET_KEYBIT, btn) < 0) {
-            perror("Failed to enable virtual button");
-            close(uinput_fd);
-            for (auto& dev : input_devices) {
-                libevdev_free(dev.dev);
+            if (dev.fd >= 0) {
                 close(dev.fd);
+                if (dev.dev) {
+                    libevdev_free(dev.dev);
+                }
             }
-            return 1;
-        }
-    }
-
-    // Virtual Controller Contract: Fixed 8 axes for ARMA stability
-    const int virtual_axes[] = {
-        ABS_X, ABS_Y,        // Left stick
-        ABS_RX, ABS_RY,      // Right stick  
-        ABS_Z, ABS_RZ,       // Analog triggers (no digital clicks)
-        ABS_HAT0X, ABS_HAT0Y // D-pad hat
-    };
-    for (int axis : virtual_axes) {
-        if (ioctl(uinput_fd, UI_SET_ABSBIT, axis) < 0) {
-            perror("Failed to enable virtual axis");
-            close(uinput_fd);
-            for (auto& dev : input_devices) {
-                libevdev_free(dev.dev);
-                close(dev.fd);
-            }
-            return 1;
-        }
-    }
-
-    // Set up uinput device for Virtual Controller (fixed contract for ARMA stability)
-    struct uinput_user_dev uidev;
-    memset(&uidev, 0, sizeof(uidev));
-    
-    strncpy(uidev.name, config.uinput_name.c_str(), UINPUT_MAX_NAME_SIZE);
-    uidev.id.bustype = BUS_USB;
-    uidev.id.vendor = 0x045e;  // Microsoft
-    uidev.id.product = 0x028e; // Xbox 360 Controller
-    uidev.id.version = 1;
-
-    // Virtual Controller Contract: Fixed axis ranges for ARMA stability
-    uidev.absmin[ABS_X] = -32768; uidev.absmax[ABS_X] = 32767;  // Left stick X
-    uidev.absmin[ABS_Y] = -32768; uidev.absmax[ABS_Y] = 32767;  // Left stick Y
-    uidev.absmin[ABS_RX] = -32768; uidev.absmax[ABS_RX] = 32767; // Right stick X
-    uidev.absmin[ABS_RY] = -32768; uidev.absmax[ABS_RY] = 32767; // Right stick Y
-    uidev.absmin[ABS_Z] = 0; uidev.absmax[ABS_Z] = 255;          // Left trigger
-    uidev.absmin[ABS_RZ] = 0; uidev.absmax[ABS_RZ] = 255;        // Right trigger
-    uidev.absmin[ABS_HAT0X] = -1; uidev.absmax[ABS_HAT0X] = 1;   // D-pad X
-    uidev.absmin[ABS_HAT0Y] = -1; uidev.absmax[ABS_HAT0Y] = 1;   // D-pad Y
-
-    // Create device
-    if (write(uinput_fd, &uidev, sizeof(uidev)) < 0) {
-        perror("Failed to write uinput device");
-        close(uinput_fd);
-        for (auto& dev : input_devices) {
-            libevdev_free(dev.dev);
-            close(dev.fd);
-        }
-        return 1;
-    }
-
-    if (ioctl(uinput_fd, UI_DEV_CREATE) < 0) {
-        perror("Failed to create uinput device");
-        close(uinput_fd);
-        for (auto& dev : input_devices) {
-            libevdev_free(dev.dev);
-            close(dev.fd);
         }
         return 1;
     }
@@ -1076,8 +1135,7 @@ int main(int argc, char* argv[]) {
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
         perror("Failed to create epoll");
-        ioctl(uinput_fd, UI_DEV_DESTROY);
-        close(uinput_fd);
+        virtual_device.cleanup();
         for (auto& dev : input_devices) {
             libevdev_free(dev.dev);
             close(dev.fd);
@@ -1092,8 +1150,7 @@ int main(int argc, char* argv[]) {
         event.data.fd = dev.fd;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, dev.fd, &event) < 0) {
             perror("Failed to add device to epoll");
-            ioctl(uinput_fd, UI_DEV_DESTROY);
-            close(uinput_fd);
+            virtual_device.cleanup();
             for (auto& d : input_devices) {
                 libevdev_free(d.dev);
                 close(d.fd);
@@ -1136,6 +1193,20 @@ int main(int argc, char* argv[]) {
     validate_and_filter_bindings(bindings, input_devices);
     
     BindingResolver resolver(bindings);
+    
+    // Apply bit depth overrides from config
+    for (const auto& input_config : config.inputs) {
+        Role role;
+        if (input_config.role == "stick") role = Role::Stick;
+        else if (input_config.role == "throttle") role = Role::Throttle;
+        else if (input_config.role == "rudder") role = Role::Rudder;
+        else continue;
+        
+        if (input_config.bit_depth > 0) {
+            resolver.set_bit_depth(role, input_config.bit_depth);
+            std::cout << "Set " << input_config.role << " to " << input_config.bit_depth << "-bit mode\n";
+        }
+    }
     
 #ifdef DEBUG_BINDINGS
     const char* debug_env = getenv("TWCS_DEBUG_BINDINGS");
@@ -1188,37 +1259,10 @@ int main(int argc, char* argv[]) {
                 
                 switch (ev.type) {
                     case EV_ABS: {
-                        // Apply axis transformation based on original logic
-                        int transformed_value = ev.value;
+                        // Pass raw values to binding resolver - it handles all conversions
                         Role role = string_to_role(source_device->role);
-                        
-                        // Apply range conversion as in original code
-                        if (ev.code == ABS_X || ev.code == ABS_Y) {
-                            // Stick axes: convert to 16-bit signed
-                            int min = libevdev_get_abs_minimum(source_device->dev, ev.code);
-                            int max = libevdev_get_abs_maximum(source_device->dev, ev.code);
-                            if (min != max) {
-                                transformed_value = (transformed_value - min) * 65535 / (max - min) - 32768;
-                                if (transformed_value > 32767) transformed_value = 32767;
-                                if (transformed_value < -32768) transformed_value = -32768;
-                            }
-                        } else if (ev.code == ABS_Z || ev.code == ABS_RZ || ev.code == ABS_THROTTLE) {
-                            // Trigger axes: convert to 0-255
-                            int min = libevdev_get_abs_minimum(source_device->dev, ev.code);
-                            int max = libevdev_get_abs_maximum(source_device->dev, ev.code);
-                            if (min != max) {
-                                transformed_value = (transformed_value - min) * 255 / (max - min);
-                                if (transformed_value > 255) transformed_value = 255;
-                                if (transformed_value < 0) transformed_value = 0;
-                            }
-                        } else if (ev.code == ABS_HAT0X || ev.code == ABS_HAT0Y) {
-                            // Hat axes: convert to -1, 0, 1
-                            transformed_value = (transformed_value > 0) ? 1 : ((transformed_value < 0) ? -1 : 0);
-                        }
-                        
-                        // Process through binding resolver
                         PhysicalInput input{role, SrcKind::Abs, static_cast<uint16_t>(ev.code)};
-                        resolver.process_input(input, transformed_value);
+                        resolver.process_input(input, ev.value);
                         break;
                     }
                     
@@ -1231,14 +1275,11 @@ int main(int argc, char* argv[]) {
                     }
                     
                     case EV_SYN:
-                        // Always pass through sync events
-                        if (write(uinput_fd, &ev, sizeof(ev)) >= 0) {
-                            events_written = false;
-                        }
+                        // Don't write sync yet - emit pending events first
                         break;
                 }
                 
-                // Emit any pending virtual events
+                // Emit any pending virtual events after processing input
                 auto pending_events = resolver.get_pending_events();
                 bool events_emitted = false;
                 
@@ -1249,22 +1290,16 @@ int main(int argc, char* argv[]) {
                     out_ev.code = slot.code;
                     out_ev.value = value;
                     
-                    if (write(uinput_fd, &out_ev, sizeof(out_ev)) >= 0) {
+                    if (virtual_device.write_event(out_ev)) {
                         events_emitted = true;
                     }
                 }
                 
                 resolver.clear_pending_events();
                 
-                // Emit sync only if we actually emitted events (safety check)
-                if (events_emitted) {
-                    struct input_event sync_ev;
-                    memset(&sync_ev, 0, sizeof(sync_ev));
-                    sync_ev.type = EV_SYN;
-                    sync_ev.code = SYN_REPORT;
-                    sync_ev.value = 0;
-                    
-                    write(uinput_fd, &sync_ev, sizeof(sync_ev));
+                // Emit sync after all pending events are written
+                if (events_emitted || ev.type == EV_SYN) {
+                    virtual_device.emit_sync();
                 }
             } else if (rc == -EAGAIN) {
                 // No data available, reset failure counter
@@ -1296,8 +1331,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Exiting...\n";
     
     // Clean up
-    ioctl(uinput_fd, UI_DEV_DESTROY);
-    close(uinput_fd);
+    virtual_device.cleanup();
     close(epoll_fd);
     for (auto& dev : input_devices) {
         libevdev_free(dev.dev);

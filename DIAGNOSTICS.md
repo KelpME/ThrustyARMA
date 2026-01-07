@@ -99,6 +99,28 @@ HEALTH SUMMARY:
   STATUS: ISSUES_DETECTED
 ```
 
+## Common Issues
+
+### Setup sees no movement on any axis
+
+**Symptom:** `twcs_setup` shows "No movement detected" for all axes during configuration
+
+**Cause:** `twcs_mapper` is running with `grab: true` and has exclusive access to input devices via EVIOCGRAB
+
+**Fix:** Stop the mapper service/process before running setup, OR set `"grab": false` in config.json and restart mapper
+
+**Commands:**
+```bash
+# Stop mapper service
+systemctl --user stop twcs-mapper.service
+
+# Or kill process
+pkill twcs_mapper
+
+# Then run setup
+./build/bin/twcs_setup
+```
+
 ## Benefits
 
 - **Non-interactive**: No user input required, fully automated

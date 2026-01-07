@@ -30,24 +30,74 @@ bool BindingResolver::is_virtual_slot_valid(const VirtualSlot& slot) const {
     }
 }
 
-int BindingResolver::apply_axis_transform(int value, const AxisTransform& xform) const {
-    if (xform.invert) {
-        value = -value;
-    }
+int BindingResolver::apply_axis_transform(int value, const AxisTransform& xform, Role role) const {
+    // Normalize input value to 0-1 range
+    float normalized;
+    float input_max;
     
-    if (xform.deadzone > 0) {
+    // Check if we have an explicit bit depth override for this role
+    auto it = bit_depth_overrides.find(role);
+    int bit_depth = (it != bit_depth_overrides.end() && it->second > 0) ? it->second : 0;
+    
+    if (bit_depth > 0) {
+        // Use explicit bit depth
         if (value < 0) {
-            value = std::min(0, value + xform.deadzone);
+            // Signed range
+            input_max = 65535.0f;
+            normalized = (value + 32768.0f) / input_max;
         } else {
-            value = std::max(0, value - xform.deadzone);
+            // Unsigned range: 2^bit_depth - 1
+            input_max = static_cast<float>((1 << bit_depth) - 1);
+            normalized = value / input_max;
+        }
+    } else {
+        // Auto-detect: check ranges from largest to smallest
+        if (value < 0) {
+            // Signed input range (-32768 to 32767)
+            normalized = (value + 32768.0f) / 65535.0f;
+            input_max = 65535.0f;
+        } else if (value > 16383) {
+            // 16-bit unsigned range (0-65535) - TWCS Throttle
+            normalized = value / 65535.0f;
+            input_max = 65535.0f;
+        } else if (value > 1023) {
+            // 14-bit unsigned range (0-16383) - T.16000M stick
+            normalized = value / 16383.0f;
+            input_max = 16383.0f;
+        } else if (value > 255) {
+            // 10-bit unsigned range (0-1023) - T-Rudder pedals
+            normalized = value / 1023.0f;
+            input_max = 1023.0f;
+        } else {
+            // 8-bit unsigned range (0-255) - legacy/simple devices
+            normalized = value / 255.0f;
+            input_max = 255.0f;
         }
     }
     
-    value = static_cast<int>(value * xform.scale);
+    // Apply inversion in normalized space
+    if (xform.invert) {
+        normalized = 1.0f - normalized;
+    }
     
-    value = std::max(xform.min_out, std::min(xform.max_out, value));
+    // Apply scale
+    normalized *= xform.scale;
     
-    return value;
+    // Clamp normalized value to valid range before mapping
+    normalized = std::max(0.0f, std::min(1.0f, normalized));
+    
+    // Map to output range
+    // For normalized [0.0, 1.0] -> [min_out, max_out]
+    int output_value = static_cast<int>(normalized * (xform.max_out - xform.min_out) + xform.min_out);
+    
+    // Final clamp to ensure we stay within bounds
+    output_value = std::max(xform.min_out, std::min(xform.max_out, output_value));
+    
+    return output_value;
+}
+
+void BindingResolver::set_bit_depth(Role role, int bit_depth) {
+    bit_depth_overrides[role] = bit_depth;
 }
 
 BindingResolver::BindingResolver(const std::vector<Binding>& bindings) : bindings(bindings) {
@@ -90,7 +140,7 @@ void BindingResolver::process_input(const PhysicalInput& input, int value) {
                 button_refcounts[binding.dst] = refcount;
                 DEBUG_LOG("Button refcount: %d\n", refcount);
             } else {
-                int transformed_value = apply_axis_transform(value, binding.xform);
+                int transformed_value = apply_axis_transform(value, binding.xform, input.role);
                 axis_values[binding.dst][input.role] = transformed_value;
                 DEBUG_LOG("Axis value for role %d: %d\n", static_cast<int>(input.role), transformed_value);
             }
@@ -238,11 +288,20 @@ std::vector<Binding> make_bindings_from_config(const std::vector<BindingConfigKe
         else if (config_abs.role == "rudder") role = Role::Rudder;
         else continue; // Skip invalid role
         
-        // Determine output range based on destination axis
+        // Determine output range based on destination axis and role
         int min_out, max_out;
         switch (config_abs.dst) {
             case ABS_X:
             case ABS_Y:
+                // For throttle/rudder on left stick, use 8-bit range for ARMA compatibility
+                if (role == Role::Throttle || role == Role::Rudder) {
+                    min_out = 0;
+                    max_out = 255;
+                } else {
+                    min_out = -32768;
+                    max_out = 32767;
+                }
+                break;
             case ABS_RX:
             case ABS_RY:
                 min_out = -32768;

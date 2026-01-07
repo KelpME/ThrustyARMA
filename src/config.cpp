@@ -76,6 +76,12 @@ std::vector<InputConfig> ConfigManager::parse_inputs(const std::string& json) {
             input_config.vendor = get_json_value(obj_str, "vendor").value_or("");
             input_config.product = get_json_value(obj_str, "product").value_or("");
             input_config.optional = get_json_value(obj_str, "optional").value_or("false") == "true";
+            
+            // Parse bit_depth if present
+            auto bit_depth_opt = get_json_value(obj_str, "bit_depth");
+            if (bit_depth_opt) {
+                input_config.bit_depth = std::stoi(*bit_depth_opt);
+            }
 
             if (!input_config.role.empty()) {
                 inputs.push_back(input_config);

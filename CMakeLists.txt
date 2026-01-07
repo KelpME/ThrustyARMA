@@ -32,6 +32,8 @@ target_compile_definitions(twcs_select PRIVATE _GNU_SOURCE)
 add_executable(twcs_mapper
     src/twcs_mapper.cpp
     src/bindings.cpp
+    src/virtual_device.cpp
+    src/epoll_loop.cpp
 )
 
 target_link_libraries(twcs_mapper config_lib ${EVDEV_LIBRARIES})

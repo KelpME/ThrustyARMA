@@ -51,6 +51,8 @@ struct CaptureState {
     std::vector<DeviceInfo> devices;
     std::vector<std::pair<std::string, int>> captured_buttons;
     std::vector<CapturedAxis> captured_axes;
+    bool abort = false;
+    std::string abort_reason;
 };
 
 // Virtual button mappings in order
@@ -151,6 +153,23 @@ std::string get_udev_property(const std::string& device_path, const std::string&
         }
     }
     return "";
+}
+
+static bool check_fd_not_grabbed(int fd, const std::string& path, std::string& err) {
+    errno = 0;
+    if (ioctl(fd, EVIOCGRAB, 1) == 0) {
+        ioctl(fd, EVIOCGRAB, 0);
+        return true;
+    }
+    if (errno == EBUSY) {
+        err = "Device '" + path + "' is exclusively grabbed via EVIOCGRAB by another process.\n"
+              "Likely culprit: twcs_mapper with grab=true.\n"
+              "Fix: stop twcs-mapper.service (or twcs_mapper process), then rerun twcs_setup.\n"
+              "Alternative: set \"grab\": false in config.json for mapper, restart mapper later.";
+        return false;
+    }
+    err = "Failed to test EVIOCGRAB on '" + path + "': " + std::string(strerror(errno));
+    return false;
 }
 
 std::string find_by_id_path(const std::string& device_path) {
@@ -485,6 +504,38 @@ void capture_axes(CaptureState& state) {
     if (!stick) {
         std::cerr << "ERROR: No stick device found for cyclic controls!\n";
         return;
+    }
+    
+    // Preflight EVIOCGRAB check for required devices
+    std::string grab_err;
+    if (!check_fd_not_grabbed(stick->fd, stick->path, grab_err)) {
+        state.abort = true;
+        state.abort_reason = "=== EVIOCGRAB CONFLICT ===\n" + grab_err + "\nRecovery:\n\nsystemctl --user stop twcs-mapper.service\n\nor set \"grab\": false in config.json (mapper) and restart mapper later\n=========================";
+        return;
+    }
+    
+    // Check throttle device if available
+    for (auto& device : state.devices) {
+        if (device.role == "throttle") {
+            if (!check_fd_not_grabbed(device.fd, device.path, grab_err)) {
+                state.abort = true;
+                state.abort_reason = "=== EVIOCGRAB CONFLICT ===\n" + grab_err + "\nRecovery:\n\nsystemctl --user stop twcs-mapper.service\n\nor set \"grab\": false in config.json (mapper) and restart mapper later\n=========================";
+                return;
+            }
+            break;
+        }
+    }
+    
+    // Check rudder device if available
+    for (auto& device : state.devices) {
+        if (device.role == "rudder") {
+            if (!check_fd_not_grabbed(device.fd, device.path, grab_err)) {
+                state.abort = true;
+                state.abort_reason = "=== EVIOCGRAB CONFLICT ===\n" + grab_err + "\nRecovery:\n\nsystemctl --user stop twcs-mapper.service\n\nor set \"grab\": false in config.json (mapper) and restart mapper later\n=========================";
+                return;
+            }
+            break;
+        }
     }
     
     // Capture CYCLIC X
@@ -909,8 +960,18 @@ int main() {
     // Phase 2: Axis Capture
     capture_axes(state);
     
+    if (state.abort) {
+        std::cerr << state.abort_reason << "\n";
+        return 1;
+    }
+    
     // Phase 3: Button Capture
     capture_buttons(state);
+    
+    if (state.abort) {
+        std::cerr << state.abort_reason << "\n";
+        return 1;
+    }
     
     // Phase 4: Confirmation with redo loop
     while (true) {
@@ -945,7 +1006,16 @@ int main() {
             
             // Redo capture phases
             capture_axes(state);
+            if (state.abort) {
+                std::cerr << state.abort_reason << "\n";
+                return 1;
+            }
+            
             capture_buttons(state);
+            if (state.abort) {
+                std::cerr << state.abort_reason << "\n";
+                return 1;
+            }
             
             continue; // loop back to confirmation
         }
