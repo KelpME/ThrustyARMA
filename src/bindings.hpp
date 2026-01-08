@@ -9,6 +9,7 @@
 // Forward declarations to avoid circular includes
 struct BindingConfigKey;
 struct BindingConfigAbs;
+struct AxisCalibration;
 
 enum class Role {
     Stick,
@@ -69,21 +70,21 @@ private:
     std::map<VirtualSlot, std::map<Role, std::optional<int>>> axis_values;
     std::map<VirtualSlot, std::optional<Role>> axis_selected_source;
     std::map<VirtualSlot, int> last_output_values;
-    std::map<Role, int> bit_depth_overrides;  // Explicit bit depths per role (0 = auto)
+    std::map<Role, std::map<int, AxisCalibration>> calibrations;  // Role -> (src_code -> calibration)
     
     static Role get_role_priority(const VirtualSlot& dst);
     bool is_virtual_slot_valid(const VirtualSlot& slot) const;
     
 public:
     BindingResolver(const std::vector<Binding>& bindings);
-    void set_bit_depth(Role role, int bit_depth);
+    void set_calibration(Role role, int src_code, const AxisCalibration& cal);
     
     void process_input(const PhysicalInput& input, int value);
     std::vector<std::pair<VirtualSlot, int>> get_pending_events();
     void clear_pending_events();
     
     // Public for diagnostics
-    int apply_axis_transform(int value, const AxisTransform& xform, Role role) const;
+    int apply_axis_transform(int value, const AxisTransform& xform, Role role, int src_code) const;
 };
 
 std::vector<Binding> make_default_bindings();

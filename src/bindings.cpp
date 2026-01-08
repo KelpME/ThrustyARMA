@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <set>
+#include <iostream>
 
 #ifdef DEBUG_BINDINGS
 bool debug_bindings_enabled = false;
@@ -30,74 +31,93 @@ bool BindingResolver::is_virtual_slot_valid(const VirtualSlot& slot) const {
     }
 }
 
-int BindingResolver::apply_axis_transform(int value, const AxisTransform& xform, Role role) const {
-    // Normalize input value to 0-1 range
-    float normalized;
-    float input_max;
+int BindingResolver::apply_axis_transform(int value, const AxisTransform& xform, Role role, int src_code) const {
+    int input_value = value;
     
-    // Check if we have an explicit bit depth override for this role
-    auto it = bit_depth_overrides.find(role);
-    int bit_depth = (it != bit_depth_overrides.end() && it->second > 0) ? it->second : 0;
-    
-    if (bit_depth > 0) {
-        // Use explicit bit depth
-        if (value < 0) {
-            // Signed range
-            input_max = 65535.0f;
-            normalized = (value + 32768.0f) / input_max;
-        } else {
-            // Unsigned range: 2^bit_depth - 1
-            input_max = static_cast<float>((1 << bit_depth) - 1);
-            normalized = value / input_max;
-        }
-    } else {
-        // Auto-detect: check ranges from largest to smallest
-        if (value < 0) {
-            // Signed input range (-32768 to 32767)
-            normalized = (value + 32768.0f) / 65535.0f;
-            input_max = 65535.0f;
-        } else if (value > 16383) {
-            // 16-bit unsigned range (0-65535) - TWCS Throttle
-            normalized = value / 65535.0f;
-            input_max = 65535.0f;
-        } else if (value > 1023) {
-            // 14-bit unsigned range (0-16383) - T.16000M stick
-            normalized = value / 16383.0f;
-            input_max = 16383.0f;
-        } else if (value > 255) {
-            // 10-bit unsigned range (0-1023) - T-Rudder pedals
-            normalized = value / 1023.0f;
-            input_max = 1023.0f;
-        } else {
-            // 8-bit unsigned range (0-255) - legacy/simple devices
-            normalized = value / 255.0f;
-            input_max = 255.0f;
+    // Check if we have calibration data for this axis
+    auto role_it = calibrations.find(role);
+    if (role_it != calibrations.end()) {
+        auto cal_it = role_it->second.find(src_code);
+        if (cal_it != role_it->second.end()) {
+            const AxisCalibration& cal = cal_it->second;
+            
+            // Apply deadzone in input space
+            if (cal.deadzone_radius > 0) {
+                if (std::abs(input_value - cal.center_value) < cal.deadzone_radius) {
+                    // Snap to center
+                    input_value = cal.center_value;
+                }
+            }
+            
+            // Clamp to calibrated range
+            input_value = std::max(cal.observed_min, std::min(cal.observed_max, input_value));
+            
+            // Detect if this is a centered axis (center not at min)
+            bool is_centered = (cal.center_value > cal.observed_min + 10);
+            
+            int output_value;
+            if (is_centered) {
+                // Two-segment mapping for centered axes (rudder, stick)
+                // Map: observed_min -> min_out, center_value -> 0, observed_max -> max_out
+                if (input_value <= cal.center_value) {
+                    // Left half: map from [observed_min, center_value] to [min_out, 0]
+                    float ratio = (input_value - cal.observed_min) / (float)(cal.center_value - cal.observed_min);
+                    output_value = static_cast<int>(ratio * (0 - xform.min_out) + xform.min_out);
+                    
+                    // Debug logging for rudder
+                    if (role == Role::Rudder) {
+                        static int log_counter = 0;
+                        if (log_counter++ % 50 == 0) {
+                            std::cerr << "[DEBUG RUDDER LEFT] input=" << input_value 
+                                     << " center=" << cal.center_value 
+                                     << " ratio=" << ratio 
+                                     << " output=" << output_value << "\n";
+                        }
+                    }
+                } else {
+                    // Right half: map from [center_value, observed_max] to [0, max_out]
+                    float ratio = (input_value - cal.center_value) / (float)(cal.observed_max - cal.center_value);
+                    output_value = static_cast<int>(ratio * xform.max_out);
+                    
+                    // Debug logging for rudder
+                    if (role == Role::Rudder) {
+                        static int log_counter = 0;
+                        if (log_counter++ % 50 == 0) {
+                            std::cerr << "[DEBUG RUDDER RIGHT] input=" << input_value 
+                                     << " center=" << cal.center_value 
+                                     << " ratio=" << ratio 
+                                     << " output=" << output_value << "\n";
+                        }
+                    }
+                }
+            } else {
+                // Single-segment mapping for one-directional axes (throttle)
+                // Map: observed_min -> min_out, observed_max -> max_out
+                float ratio = (input_value - cal.observed_min) / (float)(cal.observed_max - cal.observed_min);
+                output_value = static_cast<int>(ratio * (xform.max_out - xform.min_out) + xform.min_out);
+            }
+            
+            // Apply inversion if needed
+            if (xform.invert) {
+                output_value = xform.max_out + xform.min_out - output_value;
+            }
+            
+            // Final clamp
+            return std::max(xform.min_out, std::min(xform.max_out, output_value));
         }
     }
     
-    // Apply inversion in normalized space
+    // No calibration data - pass through with simple scaling
+    float ratio = value / 65535.0f;
     if (xform.invert) {
-        normalized = 1.0f - normalized;
+        ratio = 1.0f - ratio;
     }
-    
-    // Apply scale
-    normalized *= xform.scale;
-    
-    // Clamp normalized value to valid range before mapping
-    normalized = std::max(0.0f, std::min(1.0f, normalized));
-    
-    // Map to output range
-    // For normalized [0.0, 1.0] -> [min_out, max_out]
-    int output_value = static_cast<int>(normalized * (xform.max_out - xform.min_out) + xform.min_out);
-    
-    // Final clamp to ensure we stay within bounds
-    output_value = std::max(xform.min_out, std::min(xform.max_out, output_value));
-    
-    return output_value;
+    int output_value = static_cast<int>(ratio * (xform.max_out - xform.min_out) + xform.min_out);
+    return std::max(xform.min_out, std::min(xform.max_out, output_value));
 }
 
-void BindingResolver::set_bit_depth(Role role, int bit_depth) {
-    bit_depth_overrides[role] = bit_depth;
+void BindingResolver::set_calibration(Role role, int src_code, const AxisCalibration& cal) {
+    calibrations[role][src_code] = cal;
 }
 
 BindingResolver::BindingResolver(const std::vector<Binding>& bindings) : bindings(bindings) {
@@ -140,7 +160,7 @@ void BindingResolver::process_input(const PhysicalInput& input, int value) {
                 button_refcounts[binding.dst] = refcount;
                 DEBUG_LOG("Button refcount: %d\n", refcount);
             } else {
-                int transformed_value = apply_axis_transform(value, binding.xform, input.role);
+                int transformed_value = apply_axis_transform(value, binding.xform, input.role, input.code);
                 axis_values[binding.dst][input.role] = transformed_value;
                 DEBUG_LOG("Axis value for role %d: %d\n", static_cast<int>(input.role), transformed_value);
             }
@@ -288,22 +308,14 @@ std::vector<Binding> make_bindings_from_config(const std::vector<BindingConfigKe
         else if (config_abs.role == "rudder") role = Role::Rudder;
         else continue; // Skip invalid role
         
-        // Determine output range based on destination axis and role
+        // Determine output range based on destination axis
         int min_out, max_out;
         switch (config_abs.dst) {
             case ABS_X:
             case ABS_Y:
-                // For throttle/rudder on left stick, use 8-bit range for ARMA compatibility
-                if (role == Role::Throttle || role == Role::Rudder) {
-                    min_out = 0;
-                    max_out = 255;
-                } else {
-                    min_out = -32768;
-                    max_out = 32767;
-                }
-                break;
             case ABS_RX:
             case ABS_RY:
+                // Standard gamepad axes: -32768 to 32767 with 0 as center
                 min_out = -32768;
                 max_out = 32767;
                 break;

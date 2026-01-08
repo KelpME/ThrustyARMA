@@ -1,7 +1,7 @@
 # Thrustmaster ARMA Mapper - Makefile
 # Convenient commands for building, installing, and managing the mapper
 
-.PHONY: help build install uninstall reinstall start stop restart status watch-inputs diag clean
+.PHONY: help build install uninstall reinstall start stop restart status watch-inputs diag setup clean
 
 # Default target
 help:
@@ -17,6 +17,7 @@ help:
 	@echo "  make restart       - Restart the mapper service"
 	@echo "  make status        - Show service status"
 	@echo ""
+	@echo "  make setup         - Run calibration wizard to configure devices"
 	@echo "  make watch-inputs  - Watch real-time axis movements (Ctrl+C to exit)"
 	@echo "  make diag          - Run full diagnostics"
 	@echo ""
@@ -108,6 +109,13 @@ watch-inputs:
 	@echo "Press Ctrl+C to exit"
 	@echo ""
 	@./build/bin/twcs_mapper --diag-axes
+
+# Run calibration setup wizard
+setup: build
+	@echo "=== Device Calibration Wizard ==="
+	@echo "This will guide you through calibrating your devices"
+	@echo ""
+	@./build/bin/twcs_setup
 
 # Run full diagnostics
 diag:

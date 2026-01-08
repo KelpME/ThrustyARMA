@@ -5,13 +5,21 @@
 #include <optional>
 #include <vector>
 
+struct AxisCalibration {
+    int src_code;
+    int observed_min;
+    int observed_max;
+    int center_value;
+    int deadzone_radius;
+};
+
 struct InputConfig {
     std::string role;
     std::string by_id;
     std::string vendor;
     std::string product;
     bool optional;
-    int bit_depth = 0;  // 0 = auto-detect, 8/10/14/16 = explicit bit depth
+    std::vector<AxisCalibration> calibrations;
 };
 
 struct BindingConfigKey {

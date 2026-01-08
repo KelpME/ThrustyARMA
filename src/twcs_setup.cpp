@@ -45,6 +45,7 @@ struct CapturedAxis {
     bool invert;
     int deadzone;
     float scale;
+    AxisCalibration calibration;
 };
 
 struct CaptureState {
@@ -59,8 +60,8 @@ struct CaptureState {
 const std::vector<int> VIRTUAL_BUTTONS = {
     BTN_SOUTH,   // 1. A
     BTN_EAST,    // 2. B  
-    BTN_WEST,    // 3. X
-    BTN_NORTH,   // 4. Y
+    BTN_NORTH,   // 3. X (swapped: games expect BTN_NORTH for X)
+    BTN_WEST,    // 4. Y (swapped: games expect BTN_WEST for Y)
     BTN_TL,      // 5. Left Bumper
     BTN_TR,      // 6. Right Bumper
     BTN_SELECT,  // 7. Back
@@ -424,12 +425,13 @@ std::map<std::string, DeviceInfo> select_devices_per_role(const std::vector<Devi
     return selected_devices;
 }
 
-int capture_single_axis(DeviceInfo& device, int capture_time_ms = 1500) {
-    const int JITTER_THRESHOLD = 32;
+int detect_axis(DeviceInfo& device, const std::string& axis_name, int capture_time_ms = 4000) {
+    const int JITTER_THRESHOLD = 100;  // Increased from 32 to reduce false detections
+    const int MIN_MOVEMENT = 5000;      // Require significant movement
     std::map<int, int> delta_sum;
+    struct input_event ev;
     
     // Drain pending events first
-    struct input_event ev;
     while (libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
         // Just drain the queue
     }
@@ -463,6 +465,16 @@ int capture_single_axis(DeviceInfo& device, int capture_time_ms = 1500) {
         }
     }
     
+    // Show all detected movement for debugging
+    std::cout << "  Movement detected:\n";
+    for (const auto& [code, delta] : delta_sum) {
+        if (delta > 0) {
+            const char* axis_name = libevdev_event_code_get_name(EV_ABS, code);
+            std::cout << "    Axis " << code << " (" << (axis_name ? axis_name : "UNKNOWN") 
+                     << "): " << delta << " units\n";
+        }
+    }
+    
     // Find axis with highest delta
     int best_code = -1;
     int max_delta = 0;
@@ -473,7 +485,377 @@ int capture_single_axis(DeviceInfo& device, int capture_time_ms = 1500) {
         }
     }
     
+    // Require minimum movement
+    if (max_delta < MIN_MOVEMENT) {
+        std::cout << "  WARNING: Movement too small (" << max_delta << " < " << MIN_MOVEMENT << ")\n";
+        return -1;
+    }
+    
     return best_code;
+}
+
+std::pair<int, int> detect_two_axes(DeviceInfo& device, const std::string& description, int capture_time_ms = 2000) {
+    const int JITTER_THRESHOLD = 32;
+    std::map<int, int> delta_sum;
+    struct input_event ev;
+    
+    // Drain pending events first
+    while (libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
+        // Just drain the queue
+    }
+    
+    // Get initial values as baseline
+    std::map<int, int> baseline_values;
+    for (int code = 0; code <= ABS_MAX; code++) {
+        if (libevdev_has_event_code(device.dev, EV_ABS, code)) {
+            const struct input_absinfo* absinfo = libevdev_get_abs_info(device.dev, code);
+            if (absinfo) {
+                baseline_values[code] = absinfo->value;
+                delta_sum[code] = 0;
+            }
+        }
+    }
+    
+    auto start = std::chrono::steady_clock::now();
+    
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(capture_time_ms)) {
+        int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS) {
+            int baseline = baseline_values[ev.code];
+            int delta = std::abs(ev.value - baseline);
+            
+            if (delta >= JITTER_THRESHOLD) {
+                delta_sum[ev.code] += delta;
+            }
+        } else if (rc == -EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    
+    // Find two axes with highest deltas
+    int first_code = -1, second_code = -1;
+    int first_delta = 0, second_delta = 0;
+    
+    for (const auto& [code, delta] : delta_sum) {
+        if (delta > first_delta) {
+            second_delta = first_delta;
+            second_code = first_code;
+            first_delta = delta;
+            first_code = code;
+        } else if (delta > second_delta) {
+            second_delta = delta;
+            second_code = code;
+        }
+    }
+    
+    return {first_code, second_code};
+}
+
+std::optional<AxisCalibration> calibrate_detected_axis(DeviceInfo& device, int axis_code, const std::string& axis_name) {
+    struct input_event ev;
+    
+    // Drain pending events first
+    while (libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
+        // Just drain the queue
+    }
+    
+    std::cout << "  Calibrating axis " << axis_code << " (" << axis_name << ")\n";
+    
+    // Step 1: Measure center position and deadzone
+    std::cout << "  Step 1: Leave " << axis_name << " centered and don't touch it for 5 seconds...\n";
+    std::cout << "  Press ENTER when ready...";
+    get_line_input();
+    
+    std::vector<int> center_samples;
+    int center_min = INT_MAX;
+    int center_max = INT_MIN;
+    
+    // Get initial value
+    const struct input_absinfo* absinfo = libevdev_get_abs_info(device.dev, axis_code);
+    if (absinfo) {
+        center_samples.push_back(absinfo->value);
+        center_min = absinfo->value;
+        center_max = absinfo->value;
+    }
+    
+    auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(5000)) {
+        int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS && ev.code == axis_code) {
+            center_samples.push_back(ev.value);
+            center_min = std::min(center_min, ev.value);
+            center_max = std::max(center_max, ev.value);
+        } else if (rc == -EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    
+    // Calculate center value and deadzone
+    long long sum = 0;
+    for (int val : center_samples) {
+        sum += val;
+    }
+    int center_value = center_samples.empty() ? 0 : sum / center_samples.size();
+    int deadzone_radius = (center_max - center_min) / 2 + 10; // Add safety margin
+    
+    // Step 2: Measure full range
+    std::cout << "  Step 2: Move " << axis_name << " through FULL range in all directions for 10 seconds...\n";
+    std::cout << "  Press ENTER when ready...";
+    get_line_input();
+    
+    int range_min = center_value;
+    int range_max = center_value;
+    
+    // Get current value as starting point
+    absinfo = libevdev_get_abs_info(device.dev, axis_code);
+    if (absinfo) {
+        range_min = absinfo->value;
+        range_max = absinfo->value;
+    }
+    
+    start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(10000)) {
+        int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS && ev.code == axis_code) {
+            range_min = std::min(range_min, ev.value);
+            range_max = std::max(range_max, ev.value);
+        } else if (rc == -EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    
+    // Show results to user
+    std::cout << "  Observed MIN: " << range_min << "\n";
+    std::cout << "  Observed MAX: " << range_max << "\n";
+    std::cout << "  Center value: " << center_value << "\n";
+    std::cout << "  Deadzone radius: " << deadzone_radius << "\n";
+    
+    // Validate range
+    if (range_max - range_min < 100) {
+        std::cout << "  ERROR: Range too small (" << (range_max - range_min) << " units). Did you move the axis?\n";
+        return std::nullopt;
+    }
+    
+    AxisCalibration cal;
+    cal.src_code = axis_code;
+    cal.observed_min = range_min;
+    cal.observed_max = range_max;
+    cal.center_value = center_value;
+    cal.deadzone_radius = deadzone_radius;
+    
+    return cal;
+}
+
+std::optional<AxisCalibration> calibrate_throttle_axis(DeviceInfo& device, int axis_code, const std::string& axis_name) {
+    struct input_event ev;
+    
+    // Drain pending events first
+    while (libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
+        // Just drain the queue
+    }
+    
+    std::cout << "  Calibrating axis " << axis_code << " (" << axis_name << ")\n";
+    std::cout << "  Move " << axis_name << " through FULL range (0% to 100%) for 10 seconds...\n";
+    std::cout << "  Press ENTER when ready...";
+    get_line_input();
+    
+    int range_min = INT_MAX;
+    int range_max = INT_MIN;
+    
+    // Get current value as starting point
+    const struct input_absinfo* absinfo = libevdev_get_abs_info(device.dev, axis_code);
+    if (absinfo) {
+        range_min = absinfo->value;
+        range_max = absinfo->value;
+    }
+    
+    auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(10000)) {
+        int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS && ev.code == axis_code) {
+            range_min = std::min(range_min, ev.value);
+            range_max = std::max(range_max, ev.value);
+        } else if (rc == -EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    
+    // Show results to user
+    std::cout << "  Observed MIN (0%): " << range_min << "\n";
+    std::cout << "  Observed MAX (100%): " << range_max << "\n";
+    
+    // Validate range
+    if (range_max - range_min < 100) {
+        std::cout << "  ERROR: Range too small (" << (range_max - range_min) << " units). Did you move the throttle?\n";
+        return std::nullopt;
+    }
+    
+    // For throttle: center is at min position, no deadzone needed
+    AxisCalibration cal;
+    cal.src_code = axis_code;
+    cal.observed_min = range_min;
+    cal.observed_max = range_max;
+    cal.center_value = range_min;  // Throttle "center" is at minimum position
+    cal.deadzone_radius = 0;       // No deadzone for throttle
+    
+    return cal;
+}
+
+std::pair<std::optional<AxisCalibration>, std::optional<AxisCalibration>> calibrate_two_axes(
+    DeviceInfo& device, int axis1_code, int axis2_code, const std::string& description) {
+    
+    struct input_event ev;
+    
+    // Drain pending events first
+    while (libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
+        // Just drain the queue
+    }
+    
+    std::cout << "  Calibrating axes " << axis1_code << " and " << axis2_code << " (" << description << ")\n";
+    
+    // Step 1: Measure center position and deadzone for both axes
+    std::cout << "  Step 1: Leave stick centered and don't touch it for 5 seconds...\n";
+    std::cout << "  Press ENTER when ready...";
+    get_line_input();
+    
+    std::vector<int> center_samples1, center_samples2;
+    int center_min1 = INT_MAX, center_max1 = INT_MIN;
+    int center_min2 = INT_MAX, center_max2 = INT_MIN;
+    
+    // Get initial values
+    const struct input_absinfo* absinfo1 = libevdev_get_abs_info(device.dev, axis1_code);
+    const struct input_absinfo* absinfo2 = libevdev_get_abs_info(device.dev, axis2_code);
+    if (absinfo1) {
+        center_samples1.push_back(absinfo1->value);
+        center_min1 = absinfo1->value;
+        center_max1 = absinfo1->value;
+    }
+    if (absinfo2) {
+        center_samples2.push_back(absinfo2->value);
+        center_min2 = absinfo2->value;
+        center_max2 = absinfo2->value;
+    }
+    
+    auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(5000)) {
+        int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS) {
+            if (ev.code == axis1_code) {
+                center_samples1.push_back(ev.value);
+                center_min1 = std::min(center_min1, ev.value);
+                center_max1 = std::max(center_max1, ev.value);
+            } else if (ev.code == axis2_code) {
+                center_samples2.push_back(ev.value);
+                center_min2 = std::min(center_min2, ev.value);
+                center_max2 = std::max(center_max2, ev.value);
+            }
+        } else if (rc == -EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    
+    // Calculate center values and deadzones
+    long long sum1 = 0, sum2 = 0;
+    for (int val : center_samples1) sum1 += val;
+    for (int val : center_samples2) sum2 += val;
+    
+    int center_value1 = center_samples1.empty() ? 0 : sum1 / center_samples1.size();
+    int center_value2 = center_samples2.empty() ? 0 : sum2 / center_samples2.size();
+    int deadzone_radius1 = (center_max1 - center_min1) / 2 + 10;
+    int deadzone_radius2 = (center_max2 - center_min2) / 2 + 10;
+    
+    // Step 2: Measure full range for both axes
+    std::cout << "  Step 2: Move stick in full circles for 10 seconds...\n";
+    std::cout << "  Press ENTER when ready...";
+    get_line_input();
+    
+    int range_min1 = center_value1, range_max1 = center_value1;
+    int range_min2 = center_value2, range_max2 = center_value2;
+    
+    // Get current values as starting point
+    absinfo1 = libevdev_get_abs_info(device.dev, axis1_code);
+    absinfo2 = libevdev_get_abs_info(device.dev, axis2_code);
+    if (absinfo1) {
+        range_min1 = absinfo1->value;
+        range_max1 = absinfo1->value;
+    }
+    if (absinfo2) {
+        range_min2 = absinfo2->value;
+        range_max2 = absinfo2->value;
+    }
+    
+    start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(10000)) {
+        int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS) {
+            if (ev.code == axis1_code) {
+                range_min1 = std::min(range_min1, ev.value);
+                range_max1 = std::max(range_max1, ev.value);
+            } else if (ev.code == axis2_code) {
+                range_min2 = std::min(range_min2, ev.value);
+                range_max2 = std::max(range_max2, ev.value);
+            }
+        } else if (rc == -EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    
+    // Show results for axis 1
+    std::cout << "  Axis " << axis1_code << ":\n";
+    std::cout << "    Observed MIN: " << range_min1 << "\n";
+    std::cout << "    Observed MAX: " << range_max1 << "\n";
+    std::cout << "    Center value: " << center_value1 << "\n";
+    std::cout << "    Deadzone radius: " << deadzone_radius1 << "\n";
+    
+    // Show results for axis 2
+    std::cout << "  Axis " << axis2_code << ":\n";
+    std::cout << "    Observed MIN: " << range_min2 << "\n";
+    std::cout << "    Observed MAX: " << range_max2 << "\n";
+    std::cout << "    Center value: " << center_value2 << "\n";
+    std::cout << "    Deadzone radius: " << deadzone_radius2 << "\n";
+    
+    // Ask if user wants to retry
+    std::cout << "\n  Accept these calibration values? (y/n, default y): ";
+    std::string retry_input = get_line_input();
+    if (!retry_input.empty() && (retry_input[0] == 'n' || retry_input[0] == 'N')) {
+        std::cout << "  Retrying calibration...\n\n";
+        return calibrate_two_axes(device, axis1_code, axis2_code, description);
+    }
+    
+    // Validate ranges
+    std::optional<AxisCalibration> cal1, cal2;
+    
+    if (range_max1 - range_min1 >= 100) {
+        AxisCalibration c1;
+        c1.src_code = axis1_code;
+        c1.observed_min = range_min1;
+        c1.observed_max = range_max1;
+        c1.center_value = center_value1;
+        c1.deadzone_radius = deadzone_radius1;
+        cal1 = c1;
+    } else {
+        std::cout << "  ERROR: Axis " << axis1_code << " range too small (" << (range_max1 - range_min1) << " units)\n";
+    }
+    
+    if (range_max2 - range_min2 >= 100) {
+        AxisCalibration c2;
+        c2.src_code = axis2_code;
+        c2.observed_min = range_min2;
+        c2.observed_max = range_max2;
+        c2.center_value = center_value2;
+        c2.deadzone_radius = deadzone_radius2;
+        cal2 = c2;
+    } else {
+        std::cout << "  ERROR: Axis " << axis2_code << " range too small (" << (range_max2 - range_min2) << " units)\n";
+    }
+    
+    return {cal1, cal2};
 }
 
 bool get_invert_preference(const std::string& axis_name) {
@@ -543,22 +925,27 @@ void capture_axes(CaptureState& state) {
     std::cout << "Press ENTER and move stick left/right...";
     get_line_input();
     
-    int cyclic_x_code = capture_single_axis(*stick);
+    int cyclic_x_code = detect_axis(*stick, "CYCLIC X (stick left/right)");
     if (cyclic_x_code >= 0) {
-        bool invert = get_invert_preference("Cyclic X");
-        state.captured_axes.push_back(CapturedAxis{"stick", cyclic_x_code, ABS_RX, invert, 0, 1.0f});
-        std::cout << "Captured CYCLIC X: code " << cyclic_x_code << " -> virtual ABS_RX(3) invert=" << invert << "\n\n";
-    } else {
-        std::cout << "No movement detected. Retrying...\n";
-        // Retry once
-        std::cout << "Press ENTER and move stick left/right...";
-        get_line_input();
-        cyclic_x_code = capture_single_axis(*stick);
-        if (cyclic_x_code >= 0) {
+        std::cout << "Detected axis code: " << cyclic_x_code << "\n";
+        auto cyclic_x_cal = calibrate_detected_axis(*stick, cyclic_x_code, "CYCLIC X (stick left/right)");
+        if (cyclic_x_cal.has_value()) {
             bool invert = get_invert_preference("Cyclic X");
-            state.captured_axes.push_back(CapturedAxis{"stick", cyclic_x_code, ABS_RX, invert, 0, 1.0f});
-            std::cout << "Captured CYCLIC X: code " << cyclic_x_code << " -> virtual ABS_RX(3) invert=" << invert << "\n\n";
+            CapturedAxis axis;
+            axis.role = "stick";
+            axis.src = cyclic_x_cal->src_code;
+            axis.dst = ABS_RX;
+            axis.invert = invert;
+            axis.deadzone = cyclic_x_cal->deadzone_radius;
+            axis.scale = 1.0f;
+            axis.calibration = *cyclic_x_cal;
+            state.captured_axes.push_back(axis);
+            std::cout << "Captured CYCLIC X -> virtual ABS_RX(3) invert=" << invert << "\n\n";
+        } else {
+            std::cout << "Failed to calibrate CYCLIC X\n\n";
         }
+    } else {
+        std::cout << "No movement detected. Skipping CYCLIC X\n\n";
     }
     
     // Capture CYCLIC Y
@@ -566,21 +953,27 @@ void capture_axes(CaptureState& state) {
     std::cout << "Press ENTER and move stick forward/back...";
     get_line_input();
     
-    int cyclic_y_code = capture_single_axis(*stick);
+    int cyclic_y_code = detect_axis(*stick, "CYCLIC Y (stick forward/back)");
     if (cyclic_y_code >= 0) {
-        bool invert = get_invert_preference("Cyclic Y");
-        state.captured_axes.push_back(CapturedAxis{"stick", cyclic_y_code, ABS_RY, invert, 0, 1.0f});
-        std::cout << "Captured CYCLIC Y: code " << cyclic_y_code << " -> virtual ABS_RY(4) invert=" << invert << "\n\n";
-    } else {
-        std::cout << "No movement detected. Retrying...\n";
-        std::cout << "Press ENTER and move stick forward/back...";
-        get_line_input();
-        cyclic_y_code = capture_single_axis(*stick);
-        if (cyclic_y_code >= 0) {
+        std::cout << "Detected axis code: " << cyclic_y_code << "\n";
+        auto cyclic_y_cal = calibrate_detected_axis(*stick, cyclic_y_code, "CYCLIC Y (stick forward/back)");
+        if (cyclic_y_cal.has_value()) {
             bool invert = get_invert_preference("Cyclic Y");
-            state.captured_axes.push_back(CapturedAxis{"stick", cyclic_y_code, ABS_RY, invert, 0, 1.0f});
-            std::cout << "Captured CYCLIC Y: code " << cyclic_y_code << " -> virtual ABS_RY(4) invert=" << invert << "\n\n";
+            CapturedAxis axis;
+            axis.role = "stick";
+            axis.src = cyclic_y_cal->src_code;
+            axis.dst = ABS_RY;
+            axis.invert = invert;
+            axis.deadzone = cyclic_y_cal->deadzone_radius;
+            axis.scale = 1.0f;
+            axis.calibration = *cyclic_y_cal;
+            state.captured_axes.push_back(axis);
+            std::cout << "Captured CYCLIC Y -> virtual ABS_RY(4) invert=" << invert << "\n\n";
+        } else {
+            std::cout << "Failed to calibrate CYCLIC Y\n\n";
         }
+    } else {
+        std::cout << "No movement detected. Skipping CYCLIC Y\n\n";
     }
     
     // Capture COLLECTIVE (left stick Y -> ABS_Y)
@@ -597,21 +990,27 @@ void capture_axes(CaptureState& state) {
         std::cout << "Press ENTER and move throttle through full range...";
         get_line_input();
         
-        int collective_code = capture_single_axis(*throttle);
+        int collective_code = detect_axis(*throttle, "COLLECTIVE (throttle)");
         if (collective_code >= 0) {
-            bool invert = get_invert_preference("Collective");
-            state.captured_axes.push_back(CapturedAxis{"throttle", collective_code, ABS_Y, invert, 0, 1.0f});
-            std::cout << "Captured COLLECTIVE: code " << collective_code << " -> virtual ABS_Y(1) invert=" << invert << "\n\n";
-        } else {
-            std::cout << "No movement detected. Retrying...\n";
-            std::cout << "Press ENTER and move throttle through full range...";
-            get_line_input();
-            collective_code = capture_single_axis(*throttle);
-            if (collective_code >= 0) {
+            std::cout << "Detected axis code: " << collective_code << "\n";
+            auto collective_cal = calibrate_throttle_axis(*throttle, collective_code, "COLLECTIVE (throttle)");
+            if (collective_cal.has_value()) {
                 bool invert = get_invert_preference("Collective");
-                state.captured_axes.push_back(CapturedAxis{"throttle", collective_code, ABS_Y, invert, 0, 1.0f});
-                std::cout << "Captured COLLECTIVE: code " << collective_code << " -> virtual ABS_Y(1) invert=" << invert << "\n\n";
+                CapturedAxis axis;
+                axis.role = "throttle";
+                axis.src = collective_cal->src_code;
+                axis.dst = ABS_Y;
+                axis.invert = invert;
+                axis.deadzone = 0;  // No deadzone for throttle
+                axis.scale = 1.0f;
+                axis.calibration = *collective_cal;
+                state.captured_axes.push_back(axis);
+                std::cout << "Captured COLLECTIVE -> virtual ABS_Y(1) invert=" << invert << "\n\n";
+            } else {
+                std::cout << "Failed to calibrate COLLECTIVE\n\n";
             }
+        } else {
+            std::cout << "No movement detected. Skipping COLLECTIVE\n\n";
         }
     } else {
         std::cout << "C) COLLECTIVE - no throttle device found, skipping\n\n";
@@ -631,21 +1030,27 @@ void capture_axes(CaptureState& state) {
         std::cout << "Press ENTER and move rudder pedals left/right...";
         get_line_input();
         
-        int antitorque_code = capture_single_axis(*rudder);
+        int antitorque_code = detect_axis(*rudder, "ANTI-TORQUE (rudder pedals)");
         if (antitorque_code >= 0) {
-            bool invert = get_invert_preference("Anti-torque");
-            state.captured_axes.push_back(CapturedAxis{"rudder", antitorque_code, ABS_X, invert, 0, 1.0f});
-            std::cout << "Captured ANTI-TORQUE: code " << antitorque_code << " -> virtual ABS_X(0) invert=" << invert << "\n\n";
-        } else {
-            std::cout << "No movement detected. Retrying...\n";
-            std::cout << "Press ENTER and move rudder pedals left/right...";
-            get_line_input();
-            antitorque_code = capture_single_axis(*rudder);
-            if (antitorque_code >= 0) {
+            std::cout << "Detected axis code: " << antitorque_code << "\n";
+            auto antitorque_cal = calibrate_detected_axis(*rudder, antitorque_code, "ANTI-TORQUE (rudder pedals)");
+            if (antitorque_cal.has_value()) {
                 bool invert = get_invert_preference("Anti-torque");
-                state.captured_axes.push_back(CapturedAxis{"rudder", antitorque_code, ABS_X, invert, 0, 1.0f});
-                std::cout << "Captured ANTI-TORQUE: code " << antitorque_code << " -> virtual ABS_X(0) invert=" << invert << "\n\n";
+                CapturedAxis axis;
+                axis.role = "rudder";
+                axis.src = antitorque_cal->src_code;
+                axis.dst = ABS_X;
+                axis.invert = invert;
+                axis.deadzone = antitorque_cal->deadzone_radius;
+                axis.scale = 1.0f;
+                axis.calibration = *antitorque_cal;
+                state.captured_axes.push_back(axis);
+                std::cout << "Captured ANTI-TORQUE -> virtual ABS_X(0) invert=" << invert << "\n\n";
+            } else {
+                std::cout << "Failed to calibrate ANTI-TORQUE\n\n";
             }
+        } else {
+            std::cout << "No movement detected. Skipping ANTI-TORQUE\n\n";
         }
     } else {
         std::cout << "D) ANTI-TORQUE - no rudder device found, skipping\n\n";
@@ -695,32 +1100,55 @@ void capture_buttons(CaptureState& state) {
                     if (has_detection) {
                         std::cout << "ACCEPTED\n";
                         state.captured_buttons.push_back({captured_device, captured_code});
+                        
+                        // Drain all pending events from all devices before moving to next button
+                        for (auto& dev : state.devices) {
+                            struct input_event drain_ev;
+                            while (libevdev_next_event(dev.dev, LIBEVDEV_READ_FLAG_NORMAL, &drain_ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
+                                // Just drain
+                            }
+                        }
+                        
                         set_nonblocking(false);
                         goto next_button;
                     }
                 }
                 
-                // Listen to all devices for button press
+                // Listen to all devices for button press - check ALL devices, don't break early
+                bool new_detection = false;
                 for (auto& device : state.devices) {
                     struct input_event ev;
-                    int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+                    int rc;
                     
-                    if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_KEY && ev.value == 1) {
-                        // Clear the "Waiting for input..." line
-                        std::cout << "\r" << std::string(50, ' ') << "\r";
-                        std::cout << "Detected: " << device.role << " " << ev.code << "\n";
-                        std::cout << "Press ENTER to accept, or press another button to override\n";
-                        std::cout.flush();
-                        
-                        captured_device = device.role;
-                        captured_code = ev.code;
-                        has_detection = true;
-                        break;
+                    // Drain all events from this device to ensure we don't miss anything
+                    while ((rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev)) == LIBEVDEV_READ_STATUS_SUCCESS) {
+                        if (ev.type == EV_KEY && ev.value == 1) {
+                            // Clear the "Waiting for input..." line
+                            std::cout << "\r" << std::string(50, ' ') << "\r";
+                            std::cout << "Detected: " << device.role << " " << ev.code << "\n";
+                            std::cout << "Press ENTER to accept, or press another button to override\n";
+                            std::cout.flush();
+                            
+                            captured_device = device.role;
+                            captured_code = ev.code;
+                            has_detection = true;
+                            new_detection = true;
+                        }
+                    }
+                    
+                    // Handle SYN_DROPPED to resync device state
+                    if (rc == LIBEVDEV_READ_STATUS_SYNC) {
+                        while (libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_SYNC, &ev) == LIBEVDEV_READ_STATUS_SYNC) {
+                            // Resync
+                        }
                     }
                 }
                 
-                if (restart_phase || has_detection) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (restart_phase) break;
+                if (new_detection) continue; // Don't sleep if we just detected something
+                
+                // Very short sleep to reduce CPU usage but minimize missed events
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
             
             set_nonblocking(false);
@@ -761,6 +1189,13 @@ bool write_config(const CaptureState& state, const Config& existing_config) {
         input.vendor = device.vendor;
         input.product = device.product;
         input.optional = (device.role != "stick"); // Stick is required, others optional
+        
+        // Add calibrations for this device from captured axes
+        for (const auto& axis : state.captured_axes) {
+            if (axis.role == device.role) {
+                input.calibrations.push_back(axis.calibration);
+            }
+        }
         
         config.inputs.push_back(input);
     }
@@ -977,11 +1412,11 @@ int main() {
     while (true) {
         print_summary(state);
         
-        std::cout << "\nPress ENTER to accept, or wait 5 seconds to accept automatically.\n";
+        std::cout << "\nPress ENTER to accept, or wait 10 seconds to accept automatically.\n";
         std::cout << "Press 'r' to redo capture.\n";
         
         set_nonblocking(true);
-        char c = get_key_with_timeout(5000); // 5 second timeout
+        char c = get_key_with_timeout(10000); // 5 second timeout
         set_nonblocking(false);
         
         if (c == '\r' || c == '\n' || c == 0) { // ENTER or timeout

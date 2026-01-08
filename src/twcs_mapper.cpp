@@ -706,7 +706,7 @@ int diag_axes_mode(const Config& config) {
     validate_and_filter_bindings(bindings, input_devices);
     BindingResolver resolver(bindings);
     
-    // Apply bit depth overrides from config
+    // Apply calibrations from config
     for (const auto& input_config : config.inputs) {
         Role role;
         if (input_config.role == "stick") role = Role::Stick;
@@ -714,8 +714,8 @@ int diag_axes_mode(const Config& config) {
         else if (input_config.role == "rudder") role = Role::Rudder;
         else continue;
         
-        if (input_config.bit_depth > 0) {
-            resolver.set_bit_depth(role, input_config.bit_depth);
+        for (const auto& cal : input_config.calibrations) {
+            resolver.set_calibration(role, cal.src_code, cal);
         }
     }
     
@@ -867,7 +867,7 @@ int diag_axes_mode(const Config& config) {
                             if (now - last_print[print_key] >= print_interval) {
                                 // Apply transform to show output value
                                 Role role = string_to_role(source_device->role);
-                                int transformed = resolver.apply_axis_transform(ev.value, binding.xform, role);
+                                int transformed = resolver.apply_axis_transform(ev.value, binding.xform, role, ev.code);
                                 
                                 const char* device_name = libevdev_get_name(source_device->dev);
                                 const char* src_name = libevdev_event_code_get_name(EV_ABS, ev.code);
@@ -1194,7 +1194,7 @@ int main(int argc, char* argv[]) {
     
     BindingResolver resolver(bindings);
     
-    // Apply bit depth overrides from config
+    // Apply calibrations from config
     for (const auto& input_config : config.inputs) {
         Role role;
         if (input_config.role == "stick") role = Role::Stick;
@@ -1202,9 +1202,10 @@ int main(int argc, char* argv[]) {
         else if (input_config.role == "rudder") role = Role::Rudder;
         else continue;
         
-        if (input_config.bit_depth > 0) {
-            resolver.set_bit_depth(role, input_config.bit_depth);
-            std::cout << "Set " << input_config.role << " to " << input_config.bit_depth << "-bit mode\n";
+        for (const auto& cal : input_config.calibrations) {
+            resolver.set_calibration(role, cal.src_code, cal);
+            std::cout << "Loaded calibration for " << input_config.role << " axis " << cal.src_code 
+                     << " (range: " << cal.observed_min << "-" << cal.observed_max << ")\n";
         }
     }
     

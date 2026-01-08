@@ -77,10 +77,42 @@ std::vector<InputConfig> ConfigManager::parse_inputs(const std::string& json) {
             input_config.product = get_json_value(obj_str, "product").value_or("");
             input_config.optional = get_json_value(obj_str, "optional").value_or("false") == "true";
             
-            // Parse bit_depth if present
-            auto bit_depth_opt = get_json_value(obj_str, "bit_depth");
-            if (bit_depth_opt) {
-                input_config.bit_depth = std::stoi(*bit_depth_opt);
+            // Parse calibrations array if present
+            auto calibrations_opt = get_json_value(obj_str, "calibrations");
+            if (calibrations_opt) {
+                std::string cal_str = *calibrations_opt;
+                if (!cal_str.empty() && cal_str.front() == '[' && cal_str.back() == ']') {
+                    cal_str = cal_str.substr(1, cal_str.length() - 2);
+                }
+                
+                size_t cal_pos = 0;
+                while (cal_pos < cal_str.length()) {
+                    size_t cal_obj_start = cal_str.find('{', cal_pos);
+                    if (cal_obj_start == std::string::npos) break;
+                    
+                    int cal_brace_count = 1;
+                    size_t cal_obj_end = cal_obj_start + 1;
+                    while (cal_obj_end < cal_str.length() && cal_brace_count > 0) {
+                        if (cal_str[cal_obj_end] == '{') cal_brace_count++;
+                        else if (cal_str[cal_obj_end] == '}') cal_brace_count--;
+                        cal_obj_end++;
+                    }
+                    
+                    if (cal_brace_count == 0) {
+                        std::string cal_obj_str = cal_str.substr(cal_obj_start, cal_obj_end - cal_obj_start);
+                        
+                        AxisCalibration cal;
+                        cal.src_code = std::stoi(get_json_value(cal_obj_str, "src_code").value_or("0"));
+                        cal.observed_min = std::stoi(get_json_value(cal_obj_str, "observed_min").value_or("0"));
+                        cal.observed_max = std::stoi(get_json_value(cal_obj_str, "observed_max").value_or("65535"));
+                        cal.center_value = std::stoi(get_json_value(cal_obj_str, "center_value").value_or("32768"));
+                        cal.deadzone_radius = std::stoi(get_json_value(cal_obj_str, "deadzone_radius").value_or("0"));
+                        
+                        input_config.calibrations.push_back(cal);
+                    }
+                    
+                    cal_pos = cal_obj_end;
+                }
             }
 
             if (!input_config.role.empty()) {
@@ -126,6 +158,26 @@ bool ConfigManager::save(const std::string& config_path, const Config& config) {
         file << "      \"vendor\": \"" << escape_json_string(input.vendor) << "\",\n";
         file << "      \"product\": \"" << escape_json_string(input.product) << "\",\n";
         file << "      \"optional\": " << (input.optional ? "true" : "false");
+        
+        if (!input.calibrations.empty()) {
+            file << ",\n";
+            file << "      \"calibrations\": [\n";
+            for (size_t j = 0; j < input.calibrations.size(); j++) {
+                const auto& cal = input.calibrations[j];
+                file << "        {\n";
+                file << "          \"src_code\": " << cal.src_code << ",\n";
+                file << "          \"observed_min\": " << cal.observed_min << ",\n";
+                file << "          \"observed_max\": " << cal.observed_max << ",\n";
+                file << "          \"center_value\": " << cal.center_value << ",\n";
+                file << "          \"deadzone_radius\": " << cal.deadzone_radius << "\n";
+                file << "        }";
+                file << (j < input.calibrations.size() - 1 ? ",\n" : "\n");
+            }
+            file << "      ]\n";
+        } else {
+            file << "\n";
+        }
+        
         file << (i < config.inputs.size() - 1 ? "    },\n" : "    }\n");
     }
 
