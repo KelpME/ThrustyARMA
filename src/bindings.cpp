@@ -260,17 +260,23 @@ std::vector<Binding> make_default_bindings() {
     bindings.push_back({{Role::Rudder, SrcKind::Abs, ABS_RZ}, {SrcKind::Abs, ABS_RZ}, {false, 0, 1.0f, 0, 255}});
     
     // Button mappings - all roles map to the same virtual buttons
+    // Organized: Primary heli controls first, then triggers/auxiliary buttons
     const std::map<int, int> button_mappings = {
-        {BTN_TRIGGER, BTN_SOUTH},
-        {BTN_THUMB, BTN_EAST},
-        {BTN_THUMB2, BTN_WEST},
-        {BTN_TOP, BTN_NORTH},
-        {BTN_TOP2, BTN_TL},
-        {BTN_PINKIE, BTN_TR},
-        {BTN_BASE, BTN_SELECT},
-        {BTN_BASE2, BTN_START},
-        {BTN_BASE3, BTN_THUMBL},
-        {BTN_BASE4, BTN_THUMBR}
+        // Primary heli controls (face buttons, shoulders, system)
+        {BTN_TRIGGER, BTN_SOUTH},      // Primary trigger -> A button
+        {BTN_THUMB, BTN_EAST},          // Thumb button -> B button
+        {BTN_THUMB2, BTN_WEST},         // Thumb 2 -> X button
+        {BTN_TOP, BTN_NORTH},           // Top button -> Y button
+        {BTN_TOP2, BTN_TL},             // Top 2 -> Left shoulder
+        {BTN_PINKIE, BTN_TR},           // Pinkie -> Right shoulder
+        {BTN_BASE, BTN_SELECT},         // Base -> Select/Back
+        {BTN_BASE2, BTN_START},         // Base 2 -> Start
+        
+        // Triggers and auxiliary controls
+        {BTN_BASE3, BTN_THUMBL},        // Base 3 -> Left stick click
+        {BTN_BASE4, BTN_THUMBR},        // Base 4 -> Right stick click
+        {BTN_BASE5, BTN_TL2},           // Base 5 -> Left trigger click
+        {BTN_BASE6, BTN_TR2}            // Base 6 -> Right trigger click
     };
     
     for (const auto& [src_btn, dst_btn] : button_mappings) {
@@ -347,8 +353,10 @@ std::vector<Binding> make_bindings_from_config(const std::vector<BindingConfigKe
 bool validate_bindings(const std::vector<Binding>& bindings) {
     static const std::unordered_set<uint16_t> valid_buttons = {
         BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH,
-        BTN_TL, BTN_TR, BTN_SELECT, BTN_START, BTN_MODE,
-        BTN_THUMBL, BTN_THUMBR
+        BTN_TL, BTN_TR, BTN_TL2, BTN_TR2,
+        BTN_SELECT, BTN_START, BTN_MODE,
+        BTN_THUMBL, BTN_THUMBR,
+        BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT
     };
     
     static const std::unordered_set<uint16_t> valid_axes = {

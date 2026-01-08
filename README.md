@@ -32,18 +32,19 @@ ARMA binding stability depends on this contract remaining exactly as specified.
 ### Axes (8 total)
 - **`ABS_X`, `ABS_Y`** - Left stick (-32768 to 32767)
 - **`ABS_RX`, `ABS_RY`** - Right stick (-32768 to 32767) 
-- **`ABS_Z`** - Left trigger analog (0-255) **(no digital click)**
-- **`ABS_RZ`** - Right trigger analog (0-255) **(no digital click)**
+- **`ABS_Z`** - Left trigger analog (0-255)
+- **`ABS_RZ`** - Right trigger analog (0-255)
 - **`ABS_HAT0X`, `ABS_HAT0Y`** - D-pad hat (-1 to 1)
 
-### Buttons (11 total)
+### Buttons (17 total)
 - **Face buttons**: `BTN_SOUTH`, `BTN_EAST`, `BTN_WEST`, `BTN_NORTH`
-- **Shoulder buttons**: `BTN_TL`, `BTN_TR` **(no digital triggers)**
+- **Shoulder buttons**: `BTN_TL`, `BTN_TR`
+- **Trigger buttons**: `BTN_TL2`, `BTN_TR2` **(digital trigger clicks)**
 - **System buttons**: `BTN_SELECT`, `BTN_START`, `BTN_MODE`
 - **Stick buttons**: `BTN_THUMBL`, `BTN_THUMBR`
+- **D-pad buttons**: `BTN_DPAD_UP`, `BTN_DPAD_DOWN`, `BTN_DPAD_LEFT`, `BTN_DPAD_RIGHT`
 
 ### Out of Scope
-- **No digital trigger clicks** (BTN_TL2, BTN_TR2)
 - **No macros or keyboard output** (future feature only after mapping TUI is stable)
 
 ## Device Mapping Strategy
@@ -64,6 +65,8 @@ ARMA binding stability depends on this contract remaining exactly as specified.
 - `BTN_BASE2` → `BTN_START` (system button)
 - `BTN_BASE3` → `BTN_THUMBL` (stick click)
 - `BTN_BASE4` → `BTN_THUMBR` (stick click)
+- `BTN_BASE5` → `BTN_TL2` (left trigger click)
+- `BTN_BASE6` → `BTN_TR2` (right trigger click)
 
 ### TWCS Throttle (Role: throttle)
 **Virtual Device Mapping:**
@@ -201,19 +204,49 @@ You can customize physical-to-virtual mappings by adding a `bindings` section to
 sudo pacman -S libevdev ncurses cmake base-devel
 ```
 
-## Building
+## Installation
+
+### Build vs Install
+
+**Building** compiles the code and creates executables in `./build/bin/` but doesn't install them:
+```bash
+./build.sh build
+./build/bin/twcs_mapper  # Run from project directory only
+```
+
+**Installing** builds the project AND copies executables to `~/.local/bin/` so they're available system-wide:
+```bash
+./install.sh
+twcs_mapper  # Run from anywhere
+```
+
+### Quick Install (Recommended)
 
 ```bash
-# Clone or extract the source
 cd ThrustyARMA
+./install.sh
+```
 
-# Using build script (recommended)
+This will:
+- Check dependencies (libevdev, ncurses)
+- Build the project
+- Install binaries to `~/.local/bin` (available system-wide)
+- **Optionally** install systemd service for autostart (you'll be prompted)
+
+### Development Build (No Install)
+
+For development/testing without installing:
+```bash
+# Using build script
 ./build.sh build
 
 # Or manual CMake
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . --config Release
+
+# Run from build directory
+./build/bin/twcs_mapper
 ```
 
 ## Usage
@@ -414,32 +447,34 @@ sudo usermod -a -G input $USER
 ls -la /dev/input/by-id/*event*
 ```
 
-## systemd Integration
+## Autostart (Optional)
 
-The `twcs-mapper.service` template works for user services:
+The installer prompts you to enable autostart via systemd. If you skipped it or want to enable/disable it later:
 
-### Install
+### Enable Autostart
 ```bash
-# Copy to user services
 mkdir -p ~/.config/systemd/user
 cp twcs-mapper.service ~/.config/systemd/user/
-
-# Enable and start
 systemctl --user daemon-reload
-systemctl --user enable twcs-mapper.service
-systemctl --user start twcs-mapper.service
+systemctl --user enable --now twcs-mapper.service
 ```
 
-### Management
+### Disable Autostart
+```bash
+systemctl --user disable --now twcs-mapper.service
+```
+
+### Service Management
 ```bash
 # Check status
 systemctl --user status twcs-mapper.service
 
-# Stop manually
+# Start/stop manually
+systemctl --user start twcs-mapper.service
 systemctl --user stop twcs-mapper.service
 
 # View logs
-journalctl --user -u twcs-mapper.service
+journalctl --user -u twcs-mapper.service -f
 ```
 
 ## Project Structure
@@ -467,7 +502,7 @@ ThrustyARMA/
 - **Binding resolution**: Resolves conflicts using role-priority and OR semantics
 - **Graceful shutdown**: Clean up on SIGINT/SIGTERM, release grabs, destroy virtual device
 - **Resilience**: Optional device failures don't stop the daemon
-- **Fixed virtual controller**: Always creates 8 axes + 11 buttons contract for ARMA stability
+- **Fixed virtual controller**: Always creates 8 axes + 17 buttons contract for ARMA stability
 - **Configurable mappings**: Physical→virtual mappings customizable via TUI or JSON
 - **Device priority**: Stick > throttle > rudder for button mappings
 

@@ -93,11 +93,17 @@ const std::vector<ConfigVirtualSlot> VALID_SLOTS = {
     {BTN_NORTH, InputType::KEY, "BTN_NORTH"},
     {BTN_TL, InputType::KEY, "BTN_TL"},
     {BTN_TR, InputType::KEY, "BTN_TR"},
+    {BTN_TL2, InputType::KEY, "BTN_TL2"},
+    {BTN_TR2, InputType::KEY, "BTN_TR2"},
     {BTN_SELECT, InputType::KEY, "BTN_SELECT"},
     {BTN_START, InputType::KEY, "BTN_START"},
     {BTN_MODE, InputType::KEY, "BTN_MODE"},
     {BTN_THUMBL, InputType::KEY, "BTN_THUMBL"},
-    {BTN_THUMBR, InputType::KEY, "BTN_THUMBR"}
+    {BTN_THUMBR, InputType::KEY, "BTN_THUMBR"},
+    {BTN_DPAD_UP, InputType::KEY, "BTN_DPAD_UP"},
+    {BTN_DPAD_DOWN, InputType::KEY, "BTN_DPAD_DOWN"},
+    {BTN_DPAD_LEFT, InputType::KEY, "BTN_DPAD_LEFT"},
+    {BTN_DPAD_RIGHT, InputType::KEY, "BTN_DPAD_RIGHT"}
 };
 
 std::string get_config_path() {
