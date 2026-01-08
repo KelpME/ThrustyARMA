@@ -64,17 +64,24 @@ const std::vector<int> VIRTUAL_BUTTONS = {
     BTN_WEST,    // 4. Y (swapped: games expect BTN_WEST for Y)
     BTN_TL,      // 5. Left Bumper
     BTN_TR,      // 6. Right Bumper
-    BTN_SELECT,  // 7. Back
-    BTN_START,   // 8. Start
-    BTN_MODE,    // 9. Guide
-    BTN_THUMBL,  // 10. L3
-    BTN_THUMBR   // 11. R3
+    BTN_TL2,     // 7. Left Trigger
+    BTN_TR2,     // 8. Right Trigger
+    BTN_SELECT,  // 9. Back
+    BTN_START,   // 10. Start
+    BTN_MODE,    // 11. Guide
+    BTN_THUMBL,  // 12. L3
+    BTN_THUMBR,  // 13. R3
+    BTN_DPAD_UP,    // 14. D-pad Up
+    BTN_DPAD_DOWN,  // 15. D-pad Down
+    BTN_DPAD_LEFT,  // 16. D-pad Left
+    BTN_DPAD_RIGHT  // 17. D-pad Right
 };
 
 const std::vector<std::string> BUTTON_NAMES = {
     "A (South)", "B (East)", "X (West)", "Y (North)",
-    "Left Bumper", "Right Bumper", "Back (Select)", "Start",
-    "Guide", "L3 (Left Stick)", "R3 (Right Stick)"
+    "Left Bumper", "Right Bumper", "Left Trigger", "Right Trigger",
+    "Back (Select)", "Start", "Guide", "L3 (Left Stick)", "R3 (Right Stick)",
+    "D-pad Up", "D-pad Down", "D-pad Left", "D-pad Right"
 };
 
 void set_nonblocking(bool enable) {
@@ -165,7 +172,7 @@ static bool check_fd_not_grabbed(int fd, const std::string& path, std::string& e
     if (errno == EBUSY) {
         err = "Device '" + path + "' is exclusively grabbed via EVIOCGRAB by another process.\n"
               "Likely culprit: twcs_mapper with grab=true.\n"
-              "Fix: stop twcs-mapper.service (or twcs_mapper process), then rerun twcs_setup.\n"
+              "Fix: Run 'make stop' to stop the mapper, then rerun 'make setup'.\n"
               "Alternative: set \"grab\": false in config.json for mapper, restart mapper later.";
         return false;
     }
@@ -649,6 +656,281 @@ std::optional<AxisCalibration> calibrate_detected_axis(DeviceInfo& device, int a
     return cal;
 }
 
+std::pair<int, std::optional<AxisCalibration>> detect_and_calibrate_throttle_axis(DeviceInfo& device, const std::string& axis_name, int capture_time_ms = 6000) {
+    const int JITTER_THRESHOLD = 100;
+    const int MIN_MOVEMENT = 5000;
+    std::map<int, int> delta_sum;
+    std::map<int, int> range_min;
+    std::map<int, int> range_max;
+    struct input_event ev;
+    
+    // Drain pending events first
+    while (libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
+        // Just drain the queue
+    }
+    
+    // Get initial values as baseline and initialize min/max tracking
+    std::map<int, int> baseline_values;
+    for (int code = 0; code <= ABS_MAX; code++) {
+        if (libevdev_has_event_code(device.dev, EV_ABS, code)) {
+            const struct input_absinfo* absinfo = libevdev_get_abs_info(device.dev, code);
+            if (absinfo) {
+                baseline_values[code] = absinfo->value;
+                delta_sum[code] = 0;
+                range_min[code] = absinfo->value;
+                range_max[code] = absinfo->value;
+            }
+        }
+    }
+    
+    auto start = std::chrono::steady_clock::now();
+    
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(capture_time_ms)) {
+        int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS) {
+            int baseline = baseline_values[ev.code];
+            int delta = std::abs(ev.value - baseline);
+            
+            if (delta >= JITTER_THRESHOLD) {
+                delta_sum[ev.code] += delta;
+            }
+            
+            // Track min/max for all axes
+            range_min[ev.code] = std::min(range_min[ev.code], ev.value);
+            range_max[ev.code] = std::max(range_max[ev.code], ev.value);
+        } else if (rc == -EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    
+    // Show all detected movement for debugging
+    std::cout << "  Movement detected:\n";
+    for (const auto& [code, delta] : delta_sum) {
+        if (delta > 0) {
+            const char* axis_name_str = libevdev_event_code_get_name(EV_ABS, code);
+            std::cout << "    Axis " << code << " (" << (axis_name_str ? axis_name_str : "UNKNOWN") 
+                     << "): " << delta << " units\n";
+        }
+    }
+    
+    // Find axis with highest delta
+    int best_code = -1;
+    int max_delta = 0;
+    for (const auto& [code, delta] : delta_sum) {
+        if (delta > max_delta) {
+            max_delta = delta;
+            best_code = code;
+        }
+    }
+    
+    // Require minimum movement
+    if (max_delta < MIN_MOVEMENT) {
+        std::cout << "  WARNING: Movement too small (" << max_delta << " < " << MIN_MOVEMENT << ")\n";
+        return {-1, std::nullopt};
+    }
+    
+    std::cout << "Detected axis code: " << best_code << "\n";
+    
+    // Use the captured min/max from the detection phase
+    int obs_min = range_min[best_code];
+    int obs_max = range_max[best_code];
+    
+    std::cout << "  Observed MIN (0%): " << obs_min << "\n";
+    std::cout << "  Observed MAX (100%): " << obs_max << "\n";
+    
+    // Validate range
+    if (obs_max - obs_min < 100) {
+        std::cout << "  ERROR: Range too small (" << (obs_max - obs_min) << " units). Did you move the throttle through full range?\n";
+        return {best_code, std::nullopt};
+    }
+    
+    // For throttle: center is at min position, no deadzone needed
+    AxisCalibration cal;
+    cal.src_code = best_code;
+    cal.observed_min = obs_min;
+    cal.observed_max = obs_max;
+    cal.center_value = obs_min;  // Throttle "center" is at minimum position
+    cal.deadzone_radius = 0;       // No deadzone for throttle
+    
+    return {best_code, cal};
+}
+
+std::pair<int, std::optional<AxisCalibration>> detect_and_calibrate_centered_axis(DeviceInfo& device, const std::string& axis_name, int capture_time_ms = 6000, bool offer_midpoint = false) {
+    const int JITTER_THRESHOLD = 100;
+    const int MIN_MOVEMENT = 5000;
+    std::map<int, int> delta_sum;
+    std::map<int, int> range_min;
+    std::map<int, int> range_max;
+    std::vector<std::map<int, int>> center_samples_map;
+    struct input_event ev;
+    
+    // Drain pending events first
+    while (libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
+        // Just drain the queue
+    }
+    
+    // Get initial values as baseline and initialize tracking
+    std::map<int, int> baseline_values;
+    for (int code = 0; code <= ABS_MAX; code++) {
+        if (libevdev_has_event_code(device.dev, EV_ABS, code)) {
+            const struct input_absinfo* absinfo = libevdev_get_abs_info(device.dev, code);
+            if (absinfo) {
+                baseline_values[code] = absinfo->value;
+                delta_sum[code] = 0;
+                range_min[code] = absinfo->value;
+                range_max[code] = absinfo->value;
+            }
+        }
+    }
+    
+    // Sample center values at the beginning (first 1 second)
+    auto start = std::chrono::steady_clock::now();
+    auto center_end = start + std::chrono::milliseconds(1000);
+    std::map<int, std::vector<int>> center_samples;
+    
+    while (std::chrono::steady_clock::now() < center_end) {
+        int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS) {
+            center_samples[ev.code].push_back(ev.value);
+        } else if (rc == -EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    
+    // Now capture movement for remaining time
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(capture_time_ms)) {
+        int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS) {
+            int baseline = baseline_values[ev.code];
+            int delta = std::abs(ev.value - baseline);
+            
+            if (delta >= JITTER_THRESHOLD) {
+                delta_sum[ev.code] += delta;
+            }
+            
+            // Track min/max for all axes
+            range_min[ev.code] = std::min(range_min[ev.code], ev.value);
+            range_max[ev.code] = std::max(range_max[ev.code], ev.value);
+        } else if (rc == -EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    
+    // Show all detected movement for debugging
+    std::cout << "  Movement detected:\n";
+    for (const auto& [code, delta] : delta_sum) {
+        if (delta > 0) {
+            const char* axis_name_str = libevdev_event_code_get_name(EV_ABS, code);
+            std::cout << "    Axis " << code << " (" << (axis_name_str ? axis_name_str : "UNKNOWN") 
+                     << "): " << delta << " units\n";
+        }
+    }
+    
+    // Find axis with highest delta
+    int best_code = -1;
+    int max_delta = 0;
+    for (const auto& [code, delta] : delta_sum) {
+        if (delta > max_delta) {
+            max_delta = delta;
+            best_code = code;
+        }
+    }
+    
+    // Require minimum movement
+    if (max_delta < MIN_MOVEMENT) {
+        std::cout << "  WARNING: Movement too small (" << max_delta << " < " << MIN_MOVEMENT << ")\n";
+        return {-1, std::nullopt};
+    }
+    
+    std::cout << "Detected axis code: " << best_code << "\n";
+    
+    // Calculate center value from initial samples
+    int center_value = baseline_values[best_code];
+    int center_min = center_value;
+    int center_max = center_value;
+    
+    if (!center_samples[best_code].empty()) {
+        long long sum = 0;
+        for (int val : center_samples[best_code]) {
+            sum += val;
+            center_min = std::min(center_min, val);
+            center_max = std::max(center_max, val);
+        }
+        center_value = sum / center_samples[best_code].size();
+    }
+    
+    int deadzone_radius = (center_max - center_min) / 2 + 10;
+    
+    // Use the captured min/max from the detection phase
+    int obs_min = range_min[best_code];
+    int obs_max = range_max[best_code];
+    
+    std::cout << "  Observed MIN: " << obs_min << "\n";
+    std::cout << "  Observed MAX: " << obs_max << "\n";
+    std::cout << "  Center value: " << center_value << "\n";
+    std::cout << "  Deadzone radius: " << deadzone_radius << "\n";
+    
+    // Validate range
+    if (obs_max - obs_min < 100) {
+        std::cout << "  ERROR: Range too small (" << (obs_max - obs_min) << " units). Did you move through full range?\n";
+        return {best_code, std::nullopt};
+    }
+    
+    // Sanity check center value
+    int expected_center = (obs_min + obs_max) / 2;
+    int center_error = std::abs(center_value - expected_center);
+    int range = obs_max - obs_min;
+    
+    if (range > 0 && center_error > range * 0.05) {
+        std::cout << "\n  ⚠ WARNING: Center (" << center_value 
+                  << ") is " << center_error << " units off from expected midpoint (" 
+                  << expected_center << ")\n";
+        std::cout << "  This suggests the axis wasn't centered at the start.\n";
+        
+        if (offer_midpoint) {
+            std::cout << "\n  Options:\n";
+            std::cout << "    [a] Accept measured center (" << center_value << ")\n";
+            std::cout << "    [m] Use calculated midpoint (" << expected_center << ")\n";
+            std::cout << "    [r] Retry calibration (default)\n";
+            std::cout << "  Choice (a/m/r, default r): ";
+            std::string accept_input;
+            std::getline(std::cin, accept_input);
+            if (!accept_input.empty() && (accept_input[0] == 'a' || accept_input[0] == 'A')) {
+                // Accept measured center - continue with current center_value
+            } else if (!accept_input.empty() && (accept_input[0] == 'm' || accept_input[0] == 'M')) {
+                // Use calculated midpoint
+                center_value = expected_center;
+                std::cout << "  Using calculated midpoint: " << center_value << "\n";
+            } else {
+                // Default: retry
+                return {best_code, std::nullopt};
+            }
+        } else {
+            std::cout << "\n  Retry calibration? (y/n, default y): ";
+            std::string accept_input;
+            std::getline(std::cin, accept_input);
+            if (!accept_input.empty() && (accept_input[0] == 'n' || accept_input[0] == 'N')) {
+                // Accept measured center despite warning
+            } else {
+                // Default: retry
+                return {best_code, std::nullopt};
+            }
+        }
+    }
+    
+    AxisCalibration cal;
+    cal.src_code = best_code;
+    cal.observed_min = obs_min;
+    cal.observed_max = obs_max;
+    cal.center_value = center_value;
+    cal.deadzone_radius = deadzone_radius;
+    
+    return {best_code, cal};
+}
+
 std::optional<AxisCalibration> calibrate_throttle_axis(DeviceInfo& device, int axis_code, const std::string& axis_name) {
     struct input_event ev;
     
@@ -820,12 +1102,47 @@ std::pair<std::optional<AxisCalibration>, std::optional<AxisCalibration>> calibr
     std::cout << "    Center value: " << center_value2 << "\n";
     std::cout << "    Deadzone radius: " << deadzone_radius2 << "\n";
     
-    // Ask if user wants to retry
-    std::cout << "\n  Accept these calibration values? (y/n, default y): ";
-    std::string retry_input = get_line_input();
-    if (!retry_input.empty() && (retry_input[0] == 'n' || retry_input[0] == 'N')) {
-        std::cout << "  Retrying calibration...\n\n";
-        return calibrate_two_axes(device, axis1_code, axis2_code, description);
+    // Sanity check: warn if center is way off from expected midpoint
+    int expected_center1 = (range_min1 + range_max1) / 2;
+    int expected_center2 = (range_min2 + range_max2) / 2;
+    int center_error1 = std::abs(center_value1 - expected_center1);
+    int center_error2 = std::abs(center_value2 - expected_center2);
+    int range1 = range_max1 - range_min1;
+    int range2 = range_max2 - range_min2;
+    
+    // Warn if center is off by more than 5% of the total range
+    bool center_warning = false;
+    if (range1 > 0 && center_error1 > range1 * 0.05) {
+        std::cout << "\n  ⚠ WARNING: Axis " << axis1_code << " center (" << center_value1 
+                  << ") is " << center_error1 << " units off from expected midpoint (" 
+                  << expected_center1 << ")\n";
+        std::cout << "  This suggests the stick wasn't centered during Step 1.\n";
+        center_warning = true;
+    }
+    if (range2 > 0 && center_error2 > range2 * 0.05) {
+        std::cout << "\n  ⚠ WARNING: Axis " << axis2_code << " center (" << center_value2 
+                  << ") is " << center_error2 << " units off from expected midpoint (" 
+                  << expected_center2 << ")\n";
+        std::cout << "  This suggests the stick wasn't centered during Step 1.\n";
+        center_warning = true;
+    }
+    
+    if (center_warning) {
+        std::cout << "\n  Retry calibration? (y/n, default y): ";
+        std::string retry_input = get_line_input();
+        if (retry_input.empty() || retry_input[0] == 'y' || retry_input[0] == 'Y') {
+            std::cout << "  Retrying calibration...\n\n";
+            return calibrate_two_axes(device, axis1_code, axis2_code, description);
+        }
+        // If 'n', accept measured centers and continue
+    } else {
+        // Ask if user wants to retry
+        std::cout << "\n  Accept these calibration values? (y/n, default y): ";
+        std::string retry_input = get_line_input();
+        if (!retry_input.empty() && (retry_input[0] == 'n' || retry_input[0] == 'N')) {
+            std::cout << "  Retrying calibration...\n\n";
+            return calibrate_two_axes(device, axis1_code, axis2_code, description);
+        }
     }
     
     // Validate ranges
@@ -892,7 +1209,7 @@ void capture_axes(CaptureState& state) {
     std::string grab_err;
     if (!check_fd_not_grabbed(stick->fd, stick->path, grab_err)) {
         state.abort = true;
-        state.abort_reason = "=== EVIOCGRAB CONFLICT ===\n" + grab_err + "\nRecovery:\n\nsystemctl --user stop twcs-mapper.service\n\nor set \"grab\": false in config.json (mapper) and restart mapper later\n=========================";
+        state.abort_reason = "=== EVIOCGRAB CONFLICT ===\n" + grab_err + "\n\nRecovery: Run 'make stop' then rerun 'make setup'\n=========================";
         return;
     }
     
@@ -901,7 +1218,7 @@ void capture_axes(CaptureState& state) {
         if (device.role == "throttle") {
             if (!check_fd_not_grabbed(device.fd, device.path, grab_err)) {
                 state.abort = true;
-                state.abort_reason = "=== EVIOCGRAB CONFLICT ===\n" + grab_err + "\nRecovery:\n\nsystemctl --user stop twcs-mapper.service\n\nor set \"grab\": false in config.json (mapper) and restart mapper later\n=========================";
+                state.abort_reason = "=== EVIOCGRAB CONFLICT ===\n" + grab_err + "\n\nRecovery: Run 'make stop' then rerun 'make setup'\n=========================";
                 return;
             }
             break;
@@ -913,67 +1230,100 @@ void capture_axes(CaptureState& state) {
         if (device.role == "rudder") {
             if (!check_fd_not_grabbed(device.fd, device.path, grab_err)) {
                 state.abort = true;
-                state.abort_reason = "=== EVIOCGRAB CONFLICT ===\n" + grab_err + "\nRecovery:\n\nsystemctl --user stop twcs-mapper.service\n\nor set \"grab\": false in config.json (mapper) and restart mapper later\n=========================";
+                state.abort_reason = "=== EVIOCGRAB CONFLICT ===\n" + grab_err + "\n\nRecovery: Run 'make stop' then rerun 'make setup'\n=========================";
                 return;
             }
             break;
         }
     }
     
-    // Capture CYCLIC X
-    std::cout << "A) CYCLIC X (right stick X axis)\n";
-    std::cout << "Press ENTER and move stick left/right...";
-    get_line_input();
+    // Capture CYCLIC X and CYCLIC Y together in one step
+    int cyclic_x_code = -1;
+    int cyclic_y_code = -1;
+    bool cyclics_captured = false;
     
-    int cyclic_x_code = detect_axis(*stick, "CYCLIC X (stick left/right)");
-    if (cyclic_x_code >= 0) {
-        std::cout << "Detected axis code: " << cyclic_x_code << "\n";
-        auto cyclic_x_cal = calibrate_detected_axis(*stick, cyclic_x_code, "CYCLIC X (stick left/right)");
-        if (cyclic_x_cal.has_value()) {
-            bool invert = get_invert_preference("Cyclic X");
-            CapturedAxis axis;
-            axis.role = "stick";
-            axis.src = cyclic_x_cal->src_code;
-            axis.dst = ABS_RX;
-            axis.invert = invert;
-            axis.deadzone = cyclic_x_cal->deadzone_radius;
-            axis.scale = 1.0f;
-            axis.calibration = *cyclic_x_cal;
-            state.captured_axes.push_back(axis);
-            std::cout << "Captured CYCLIC X -> virtual ABS_RX(3) invert=" << invert << "\n\n";
+    while (!cyclics_captured) {
+        std::cout << "A+B) CYCLIC X & Y (right stick both axes)\n";
+        std::cout << "Press ENTER and move stick left/right...";
+        get_line_input();
+        
+        cyclic_x_code = detect_axis(*stick, "CYCLIC X (stick left/right)");
+        if (cyclic_x_code >= 0) {
+            std::cout << "Detected CYCLIC X axis code: " << cyclic_x_code << "\n";
+            
+            // Automatically determine the other axis for CYCLIC Y
+            // For a 2-axis stick: if X is axis 0 (ABS_X), Y is axis 1 (ABS_Y), and vice versa
+            if (cyclic_x_code == ABS_X) {
+                cyclic_y_code = ABS_Y;
+            } else if (cyclic_x_code == ABS_Y) {
+                cyclic_y_code = ABS_X;
+            } else {
+                std::cout << "WARNING: Unexpected axis code " << cyclic_x_code << ", cannot auto-determine Y axis\n";
+                cyclic_y_code = -1;
+            }
+            
+            if (cyclic_y_code >= 0) {
+                std::cout << "Auto-detected CYCLIC Y axis code: " << cyclic_y_code << " (complement of CYCLIC X)\n\n";
+                
+                // Calibrate both axes together
+                auto [cyclic_x_cal, cyclic_y_cal] = calibrate_two_axes(*stick, cyclic_x_code, cyclic_y_code, "cyclic stick");
+                
+                if (cyclic_x_cal.has_value() && cyclic_y_cal.has_value()) {
+                    // Capture CYCLIC X
+                    bool invert_x = get_invert_preference("Cyclic X");
+                    CapturedAxis axis_x;
+                    axis_x.role = "stick";
+                    axis_x.src = cyclic_x_cal->src_code;
+                    axis_x.dst = ABS_RX;
+                    axis_x.invert = invert_x;
+                    axis_x.deadzone = cyclic_x_cal->deadzone_radius;
+                    axis_x.scale = 1.0f;
+                    axis_x.calibration = *cyclic_x_cal;
+                    state.captured_axes.push_back(axis_x);
+                    std::cout << "Captured CYCLIC X -> virtual ABS_RX(3) invert=" << invert_x << "\n";
+                    
+                    // Capture CYCLIC Y
+                    bool invert_y = get_invert_preference("Cyclic Y");
+                    CapturedAxis axis_y;
+                    axis_y.role = "stick";
+                    axis_y.src = cyclic_y_cal->src_code;
+                    axis_y.dst = ABS_RY;
+                    axis_y.invert = invert_y;
+                    axis_y.deadzone = cyclic_y_cal->deadzone_radius;
+                    axis_y.scale = 1.0f;
+                    axis_y.calibration = *cyclic_y_cal;
+                    state.captured_axes.push_back(axis_y);
+                    std::cout << "Captured CYCLIC Y -> virtual ABS_RY(4) invert=" << invert_y << "\n\n";
+                    
+                    cyclics_captured = true;
+                } else {
+                    std::cout << "Failed to calibrate cyclic axes\n";
+                    std::cout << "Skip or restart? (s/r, default r): ";
+                    std::string input = get_line_input();
+                    if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
+                        std::cout << "Skipping cyclic axes\n\n";
+                        cyclics_captured = true;
+                    } else {
+                        std::cout << "Restarting cyclic capture...\n\n";
+                        continue;
+                    }
+                }
+            } else {
+                std::cout << "Failed to auto-determine Y axis. Skipping cyclic axes\n\n";
+                cyclics_captured = true;
+            }
         } else {
-            std::cout << "Failed to calibrate CYCLIC X\n\n";
+            std::cout << "No movement detected. Skipping cyclic axes\n";
+            std::cout << "Skip or restart? (s/r, default r): ";
+            std::string input = get_line_input();
+            if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
+                std::cout << "Skipping cyclic axes\n\n";
+                cyclics_captured = true;
+            } else {
+                std::cout << "Restarting cyclic capture...\n\n";
+                continue;
+            }
         }
-    } else {
-        std::cout << "No movement detected. Skipping CYCLIC X\n\n";
-    }
-    
-    // Capture CYCLIC Y
-    std::cout << "B) CYCLIC Y (right stick Y axis)\n";
-    std::cout << "Press ENTER and move stick forward/back...";
-    get_line_input();
-    
-    int cyclic_y_code = detect_axis(*stick, "CYCLIC Y (stick forward/back)");
-    if (cyclic_y_code >= 0) {
-        std::cout << "Detected axis code: " << cyclic_y_code << "\n";
-        auto cyclic_y_cal = calibrate_detected_axis(*stick, cyclic_y_code, "CYCLIC Y (stick forward/back)");
-        if (cyclic_y_cal.has_value()) {
-            bool invert = get_invert_preference("Cyclic Y");
-            CapturedAxis axis;
-            axis.role = "stick";
-            axis.src = cyclic_y_cal->src_code;
-            axis.dst = ABS_RY;
-            axis.invert = invert;
-            axis.deadzone = cyclic_y_cal->deadzone_radius;
-            axis.scale = 1.0f;
-            axis.calibration = *cyclic_y_cal;
-            state.captured_axes.push_back(axis);
-            std::cout << "Captured CYCLIC Y -> virtual ABS_RY(4) invert=" << invert << "\n\n";
-        } else {
-            std::cout << "Failed to calibrate CYCLIC Y\n\n";
-        }
-    } else {
-        std::cout << "No movement detected. Skipping CYCLIC Y\n\n";
     }
     
     // Capture COLLECTIVE (left stick Y -> ABS_Y)
@@ -986,31 +1336,51 @@ void capture_axes(CaptureState& state) {
     }
     
     if (throttle) {
-        std::cout << "C) COLLECTIVE (throttle/collective)\n";
-        std::cout << "Press ENTER and move throttle through full range...";
-        get_line_input();
-        
-        int collective_code = detect_axis(*throttle, "COLLECTIVE (throttle)");
-        if (collective_code >= 0) {
-            std::cout << "Detected axis code: " << collective_code << "\n";
-            auto collective_cal = calibrate_throttle_axis(*throttle, collective_code, "COLLECTIVE (throttle)");
-            if (collective_cal.has_value()) {
-                bool invert = get_invert_preference("Collective");
-                CapturedAxis axis;
-                axis.role = "throttle";
-                axis.src = collective_cal->src_code;
-                axis.dst = ABS_Y;
-                axis.invert = invert;
-                axis.deadzone = 0;  // No deadzone for throttle
-                axis.scale = 1.0f;
-                axis.calibration = *collective_cal;
-                state.captured_axes.push_back(axis);
-                std::cout << "Captured COLLECTIVE -> virtual ABS_Y(1) invert=" << invert << "\n\n";
+        bool collective_captured = false;
+        while (!collective_captured) {
+            std::cout << "C) COLLECTIVE (throttle/collective)\n";
+            std::cout << "Press ENTER and move throttle through full range...";
+            get_line_input();
+            
+            auto [collective_code, collective_cal] = detect_and_calibrate_throttle_axis(*throttle, "COLLECTIVE (throttle)", 6000);
+            if (collective_code >= 0) {
+                if (collective_cal.has_value()) {
+                    bool invert = get_invert_preference("Collective");
+                    CapturedAxis axis;
+                    axis.role = "throttle";
+                    axis.src = collective_cal->src_code;
+                    axis.dst = ABS_Y;
+                    axis.invert = invert;
+                    axis.deadzone = 0;  // No deadzone for throttle
+                    axis.scale = 1.0f;
+                    axis.calibration = *collective_cal;
+                    state.captured_axes.push_back(axis);
+                    std::cout << "Captured COLLECTIVE -> virtual ABS_Y(1) invert=" << invert << "\n\n";
+                    collective_captured = true;
+                } else {
+                    std::cout << "Failed to calibrate COLLECTIVE\n";
+                    std::cout << "Skip or restart? (s/r, default r): ";
+                    std::string input = get_line_input();
+                    if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
+                        std::cout << "Skipping COLLECTIVE\n\n";
+                        collective_captured = true;
+                    } else {
+                        std::cout << "Restarting COLLECTIVE capture...\n\n";
+                        continue;
+                    }
+                }
             } else {
-                std::cout << "Failed to calibrate COLLECTIVE\n\n";
+                std::cout << "No movement detected. Skipping COLLECTIVE\n";
+                std::cout << "Skip or restart? (s/r, default r): ";
+                std::string input = get_line_input();
+                if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
+                    std::cout << "Skipping COLLECTIVE\n\n";
+                    collective_captured = true;
+                } else {
+                    std::cout << "Restarting COLLECTIVE capture...\n\n";
+                    continue;
+                }
             }
-        } else {
-            std::cout << "No movement detected. Skipping COLLECTIVE\n\n";
         }
     } else {
         std::cout << "C) COLLECTIVE - no throttle device found, skipping\n\n";
@@ -1026,31 +1396,52 @@ void capture_axes(CaptureState& state) {
     }
     
     if (rudder) {
-        std::cout << "D) ANTI-TORQUE (rudder pedals)\n";
-        std::cout << "Press ENTER and move rudder pedals left/right...";
-        get_line_input();
-        
-        int antitorque_code = detect_axis(*rudder, "ANTI-TORQUE (rudder pedals)");
-        if (antitorque_code >= 0) {
-            std::cout << "Detected axis code: " << antitorque_code << "\n";
-            auto antitorque_cal = calibrate_detected_axis(*rudder, antitorque_code, "ANTI-TORQUE (rudder pedals)");
-            if (antitorque_cal.has_value()) {
-                bool invert = get_invert_preference("Anti-torque");
-                CapturedAxis axis;
-                axis.role = "rudder";
-                axis.src = antitorque_cal->src_code;
-                axis.dst = ABS_X;
-                axis.invert = invert;
-                axis.deadzone = antitorque_cal->deadzone_radius;
-                axis.scale = 1.0f;
-                axis.calibration = *antitorque_cal;
-                state.captured_axes.push_back(axis);
-                std::cout << "Captured ANTI-TORQUE -> virtual ABS_X(0) invert=" << invert << "\n\n";
+        bool antitorque_captured = false;
+        while (!antitorque_captured) {
+            std::cout << "D) ANTI-TORQUE (rudder pedals)\n";
+            std::cout << "⚠ IMPORTANT: Keep rudder pedals COMPLETELY CENTERED before pressing ENTER!\n";
+            std::cout << "Press ENTER when centered, then move rudder pedals left/right...";
+            get_line_input();
+            
+            auto [antitorque_code, antitorque_cal] = detect_and_calibrate_centered_axis(*rudder, "ANTI-TORQUE (rudder pedals)", 6000, true);
+            if (antitorque_code >= 0) {
+                if (antitorque_cal.has_value()) {
+                    bool invert = get_invert_preference("Anti-torque");
+                    CapturedAxis axis;
+                    axis.role = "rudder";
+                    axis.src = antitorque_cal->src_code;
+                    axis.dst = ABS_X;
+                    axis.invert = invert;
+                    axis.deadzone = antitorque_cal->deadzone_radius;
+                    axis.scale = 1.0f;
+                    axis.calibration = *antitorque_cal;
+                    state.captured_axes.push_back(axis);
+                    std::cout << "Captured ANTI-TORQUE -> virtual ABS_X(0) invert=" << invert << "\n\n";
+                    antitorque_captured = true;
+                } else {
+                    std::cout << "Failed to calibrate ANTI-TORQUE\n";
+                    std::cout << "Skip or restart? (s/r, default r): ";
+                    std::string input = get_line_input();
+                    if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
+                        std::cout << "Skipping ANTI-TORQUE\n\n";
+                        antitorque_captured = true;
+                    } else {
+                        std::cout << "Restarting ANTI-TORQUE capture...\n\n";
+                        continue;
+                    }
+                }
             } else {
-                std::cout << "Failed to calibrate ANTI-TORQUE\n\n";
+                std::cout << "No movement detected. Skipping ANTI-TORQUE\n";
+                std::cout << "Skip or restart? (s/r, default r): ";
+                std::string input = get_line_input();
+                if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
+                    std::cout << "Skipping ANTI-TORQUE\n\n";
+                    antitorque_captured = true;
+                } else {
+                    std::cout << "Restarting ANTI-TORQUE capture...\n\n";
+                    continue;
+                }
             }
-        } else {
-            std::cout << "No movement detected. Skipping ANTI-TORQUE\n\n";
         }
     } else {
         std::cout << "D) ANTI-TORQUE - no rudder device found, skipping\n\n";
