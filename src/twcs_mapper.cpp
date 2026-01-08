@@ -159,7 +159,7 @@ void handle_device_error(InputDevice& device) {
 }
 
 void attempt_device_reconnection(InputDevice& device) {
-    if (device.online || device.optional) {
+    if (device.online) {
         return;
     }
     
@@ -302,9 +302,9 @@ int discovery_mode(const Config& config) {
         
         while (running && elapsed_seconds < 10) {
             struct input_event ev;
-            rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
             
-            if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
+            // Drain all available events to prevent missing signals
+            while ((rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev)) == LIBEVDEV_READ_STATUS_SUCCESS) {
                 if (ev.type == EV_KEY || ev.type == EV_ABS) {
                     auto code_pair = std::make_pair(ev.type, ev.code);
                     if (observed_codes.insert(code_pair).second) {
@@ -315,11 +315,13 @@ int discovery_mode(const Config& config) {
                                   << " (type=" << ev.type << ", code=" << ev.code << ")\n";
                     }
                 }
-            } else if (rc == -EAGAIN) {
+            }
+            
+            if (rc == -EAGAIN) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 auto now = std::chrono::steady_clock::now();
                 elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-            } else {
+            } else if (rc != LIBEVDEV_READ_STATUS_SUCCESS) {
                 break;
             }
         }
@@ -777,19 +779,19 @@ int diag_axes_mode(const Config& config) {
             const char* src_name = libevdev_event_code_get_name(EV_KEY, binding.src.code);
             const char* dst_name = libevdev_event_code_get_name(EV_KEY, binding.dst.code);
             
-            // Map virtual button codes to Xbox controller names
+            // Map virtual button codes to generic controller names
             std::string virtual_button_name;
-            if (binding.dst.code == BTN_SOUTH) virtual_button_name = "A Button";
-            else if (binding.dst.code == BTN_EAST) virtual_button_name = "B Button";
-            else if (binding.dst.code == BTN_WEST) virtual_button_name = "X Button";
-            else if (binding.dst.code == BTN_NORTH) virtual_button_name = "Y Button";
-            else if (binding.dst.code == BTN_TL) virtual_button_name = "Left Bumper";
-            else if (binding.dst.code == BTN_TR) virtual_button_name = "Right Bumper";
-            else if (binding.dst.code == BTN_SELECT) virtual_button_name = "Back/Select";
+            if (binding.dst.code == BTN_SOUTH) virtual_button_name = "South Button";
+            else if (binding.dst.code == BTN_EAST) virtual_button_name = "East Button";
+            else if (binding.dst.code == BTN_WEST) virtual_button_name = "West Button";
+            else if (binding.dst.code == BTN_NORTH) virtual_button_name = "North Button";
+            else if (binding.dst.code == BTN_TL) virtual_button_name = "Left Shoulder";
+            else if (binding.dst.code == BTN_TR) virtual_button_name = "Right Shoulder";
+            else if (binding.dst.code == BTN_SELECT) virtual_button_name = "Select";
             else if (binding.dst.code == BTN_START) virtual_button_name = "Start";
-            else if (binding.dst.code == BTN_MODE) virtual_button_name = "Guide/Home";
-            else if (binding.dst.code == BTN_THUMBL) virtual_button_name = "Left Stick Click";
-            else if (binding.dst.code == BTN_THUMBR) virtual_button_name = "Right Stick Click";
+            else if (binding.dst.code == BTN_MODE) virtual_button_name = "Menu";
+            else if (binding.dst.code == BTN_THUMBL) virtual_button_name = "Left Stick Button";
+            else if (binding.dst.code == BTN_THUMBR) virtual_button_name = "Right Stick Button";
             else virtual_button_name = dst_name ? dst_name : "UNKNOWN";
             
             std::cout << "  [" << device_name << "] " 
@@ -844,10 +846,10 @@ int diag_axes_mode(const Config& config) {
             
             if (!source_device) continue;
             
+            // Drain all available events from this device to prevent missing signals
             struct input_event ev;
-            int rc = libevdev_next_event(source_device->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
-            
-            if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
+            int rc;
+            while ((rc = libevdev_next_event(source_device->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev)) == LIBEVDEV_READ_STATUS_SUCCESS) {
                 Role role = string_to_role(source_device->role);
                 
                 // Handle axis events
@@ -917,18 +919,18 @@ int diag_axes_mode(const Config& config) {
                             
                             has_binding = true;
                             
-                            // Map virtual button codes to Xbox controller names
-                            if (binding.dst.code == BTN_SOUTH) virtual_button_name = "A Button";
-                            else if (binding.dst.code == BTN_EAST) virtual_button_name = "B Button";
-                            else if (binding.dst.code == BTN_WEST) virtual_button_name = "X Button";
-                            else if (binding.dst.code == BTN_NORTH) virtual_button_name = "Y Button";
-                            else if (binding.dst.code == BTN_TL) virtual_button_name = "Left Bumper";
-                            else if (binding.dst.code == BTN_TR) virtual_button_name = "Right Bumper";
-                            else if (binding.dst.code == BTN_SELECT) virtual_button_name = "Back/Select";
+                            // Map virtual button codes to generic controller names
+                            if (binding.dst.code == BTN_SOUTH) virtual_button_name = "South Button";
+                            else if (binding.dst.code == BTN_EAST) virtual_button_name = "East Button";
+                            else if (binding.dst.code == BTN_WEST) virtual_button_name = "West Button";
+                            else if (binding.dst.code == BTN_NORTH) virtual_button_name = "North Button";
+                            else if (binding.dst.code == BTN_TL) virtual_button_name = "Left Shoulder";
+                            else if (binding.dst.code == BTN_TR) virtual_button_name = "Right Shoulder";
+                            else if (binding.dst.code == BTN_SELECT) virtual_button_name = "Select";
                             else if (binding.dst.code == BTN_START) virtual_button_name = "Start";
-                            else if (binding.dst.code == BTN_MODE) virtual_button_name = "Guide/Home";
-                            else if (binding.dst.code == BTN_THUMBL) virtual_button_name = "Left Stick Click";
-                            else if (binding.dst.code == BTN_THUMBR) virtual_button_name = "Right Stick Click";
+                            else if (binding.dst.code == BTN_MODE) virtual_button_name = "Menu";
+                            else if (binding.dst.code == BTN_THUMBL) virtual_button_name = "Left Stick Button";
+                            else if (binding.dst.code == BTN_THUMBR) virtual_button_name = "Right Stick Button";
                             else {
                                 const char* dst_name = libevdev_event_code_get_name(EV_KEY, binding.dst.code);
                                 virtual_button_name = dst_name ? dst_name : ("BTN_CODE_" + std::to_string(binding.dst.code));
@@ -950,9 +952,10 @@ int diag_axes_mode(const Config& config) {
                     std::cout << " [" << (ev.value ? "PRESSED" : "RELEASED") << "]\n";
                     std::cout.flush();
                 }
-            } else if (rc == -EAGAIN) {
-                // No data available
-            } else {
+            }
+            
+            // Check why we exited the loop
+            if (rc != -EAGAIN && rc != LIBEVDEV_READ_STATUS_SUCCESS) {
                 // Read error
                 break;
             }
@@ -1250,10 +1253,10 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             
+            // Drain ALL available events from this device to prevent missing signals
             struct input_event ev;
-            int rc = libevdev_next_event(source_device->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
-            
-            if (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
+            int rc;
+            while ((rc = libevdev_next_event(source_device->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev)) == LIBEVDEV_READ_STATUS_SUCCESS) {
                 // Reset failure counter on successful read
                 source_device->consecutive_read_failures = 0;
                 events_written = false;
@@ -1302,10 +1305,13 @@ int main(int argc, char* argv[]) {
                 if (events_emitted || ev.type == EV_SYN) {
                     virtual_device.emit_sync();
                 }
-            } else if (rc == -EAGAIN) {
-                // No data available, reset failure counter
+            }
+            
+            // Check the reason we exited the loop
+            if (rc == -EAGAIN) {
+                // No more data available - this is normal
                 source_device->consecutive_read_failures = 0;
-            } else {
+            } else if (rc != LIBEVDEV_READ_STATUS_SUCCESS) {
                 // Read error - handle device disconnection
                 handle_device_error(*source_device);
             }

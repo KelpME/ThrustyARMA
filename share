@@ -1,0 +1,7 @@
+I'm not able to run the ARMA Reforger HOTAS software in Linux, I was gifted a Thrustmaster T16000m, TWCS throttle, and TFRP rudder that I was ANXIOUS to start using in ARMA Reforger. So I conducted my own daemon to catch my three devices, then a user can custom map any of your devices buttons to a virtual controller. Rudder, Throttle and Stick are working great, I can say I spent a good amount of time over the new year to get this working right! I think its finally about there. I hope it brings someone joy!
+
+Happy hunting!
+Sorry... not sorry about the troll name....
+https://github.com/KelpME/ThrustyARMA
+post script:
+I was able to use it with my other joystick (logitech extreme 3d pro) as well, but I don't have other pedals or throttles to test with.

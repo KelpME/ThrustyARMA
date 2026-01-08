@@ -16,7 +16,8 @@ Role BindingResolver::get_role_priority(const VirtualSlot& dst) {
 bool BindingResolver::is_virtual_slot_valid(const VirtualSlot& slot) const {
     static const std::unordered_set<uint16_t> valid_buttons = {
         BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH,
-        BTN_TL, BTN_TR, BTN_SELECT, BTN_START, BTN_MODE,
+        BTN_TL, BTN_TR, BTN_TL2, BTN_TR2,
+        BTN_SELECT, BTN_START, BTN_MODE,
         BTN_THUMBL, BTN_THUMBR
     };
     
@@ -41,58 +42,32 @@ int BindingResolver::apply_axis_transform(int value, const AxisTransform& xform,
         if (cal_it != role_it->second.end()) {
             const AxisCalibration& cal = cal_it->second;
             
-            // Apply deadzone in input space
-            if (cal.deadzone_radius > 0) {
-                if (std::abs(input_value - cal.center_value) < cal.deadzone_radius) {
-                    // Snap to center
-                    input_value = cal.center_value;
-                }
-            }
-            
-            // Clamp to calibrated range
-            input_value = std::max(cal.observed_min, std::min(cal.observed_max, input_value));
-            
-            // Detect if this is a centered axis (center not at min)
-            bool is_centered = (cal.center_value > cal.observed_min + 10);
+            // Determine axis type: Throttle is always unidirectional, Stick/Rudder are centered
+            bool is_centered = (role == Role::Stick || role == Role::Rudder) && 
+                               (cal.center_value > cal.observed_min + 10) &&
+                               (cal.deadzone_radius > 0);
             
             int output_value;
             if (is_centered) {
                 // Two-segment mapping for centered axes (rudder, stick)
-                // Map: observed_min -> min_out, center_value -> 0, observed_max -> max_out
-                if (input_value <= cal.center_value) {
-                    // Left half: map from [observed_min, center_value] to [min_out, 0]
-                    float ratio = (input_value - cal.observed_min) / (float)(cal.center_value - cal.observed_min);
+                // Apply deadzone and rescale to maintain smooth output
+                if (std::abs(input_value - cal.center_value) < cal.deadzone_radius) {
+                    // Inside deadzone: output center (0)
+                    output_value = 0;
+                } else if (input_value < cal.center_value) {
+                    // Left half: rescale from [observed_min, center-deadzone] to [min_out, 0]
+                    int deadzone_edge = cal.center_value - cal.deadzone_radius;
+                    float ratio = (input_value - cal.observed_min) / (float)(deadzone_edge - cal.observed_min);
                     output_value = static_cast<int>(ratio * (0 - xform.min_out) + xform.min_out);
-                    
-                    // Debug logging for rudder
-                    if (role == Role::Rudder) {
-                        static int log_counter = 0;
-                        if (log_counter++ % 50 == 0) {
-                            std::cerr << "[DEBUG RUDDER LEFT] input=" << input_value 
-                                     << " center=" << cal.center_value 
-                                     << " ratio=" << ratio 
-                                     << " output=" << output_value << "\n";
-                        }
-                    }
                 } else {
-                    // Right half: map from [center_value, observed_max] to [0, max_out]
-                    float ratio = (input_value - cal.center_value) / (float)(cal.observed_max - cal.center_value);
+                    // Right half: rescale from [center+deadzone, observed_max] to [0, max_out]
+                    int deadzone_edge = cal.center_value + cal.deadzone_radius;
+                    float ratio = (input_value - deadzone_edge) / (float)(cal.observed_max - deadzone_edge);
                     output_value = static_cast<int>(ratio * xform.max_out);
-                    
-                    // Debug logging for rudder
-                    if (role == Role::Rudder) {
-                        static int log_counter = 0;
-                        if (log_counter++ % 50 == 0) {
-                            std::cerr << "[DEBUG RUDDER RIGHT] input=" << input_value 
-                                     << " center=" << cal.center_value 
-                                     << " ratio=" << ratio 
-                                     << " output=" << output_value << "\n";
-                        }
-                    }
                 }
             } else {
-                // Single-segment mapping for one-directional axes (throttle)
-                // Map: observed_min -> min_out, observed_max -> max_out
+                // Unidirectional mapping for throttle: full range maps to full output range
+                // No deadzone for throttle (ARMA needs full precision)
                 float ratio = (input_value - cal.observed_min) / (float)(cal.observed_max - cal.observed_min);
                 output_value = static_cast<int>(ratio * (xform.max_out - xform.min_out) + xform.min_out);
             }
@@ -102,7 +77,7 @@ int BindingResolver::apply_axis_transform(int value, const AxisTransform& xform,
                 output_value = xform.max_out + xform.min_out - output_value;
             }
             
-            // Final clamp
+            // Final clamp to output range only (not input range)
             return std::max(xform.min_out, std::min(xform.max_out, output_value));
         }
     }
@@ -263,20 +238,20 @@ std::vector<Binding> make_default_bindings() {
     // Organized: Primary heli controls first, then triggers/auxiliary buttons
     const std::map<int, int> button_mappings = {
         // Primary heli controls (face buttons, shoulders, system)
-        {BTN_TRIGGER, BTN_SOUTH},      // Primary trigger -> A button
-        {BTN_THUMB, BTN_EAST},          // Thumb button -> B button
-        {BTN_THUMB2, BTN_WEST},         // Thumb 2 -> X button
-        {BTN_TOP, BTN_NORTH},           // Top button -> Y button
+        {BTN_TRIGGER, BTN_SOUTH},      // Primary trigger -> South button
+        {BTN_THUMB, BTN_EAST},          // Thumb button -> East button
+        {BTN_THUMB2, BTN_WEST},         // Thumb 2 -> West button
+        {BTN_TOP, BTN_NORTH},           // Top button -> North button
         {BTN_TOP2, BTN_TL},             // Top 2 -> Left shoulder
         {BTN_PINKIE, BTN_TR},           // Pinkie -> Right shoulder
-        {BTN_BASE, BTN_SELECT},         // Base -> Select/Back
+        {BTN_BASE, BTN_SELECT},         // Base -> Select
         {BTN_BASE2, BTN_START},         // Base 2 -> Start
         
         // Triggers and auxiliary controls
-        {BTN_BASE3, BTN_THUMBL},        // Base 3 -> Left stick click
-        {BTN_BASE4, BTN_THUMBR},        // Base 4 -> Right stick click
-        {BTN_BASE5, BTN_TL2},           // Base 5 -> Left trigger click
-        {BTN_BASE6, BTN_TR2}            // Base 6 -> Right trigger click
+        {BTN_BASE3, BTN_THUMBL},        // Base 3 -> Left stick button
+        {BTN_BASE4, BTN_THUMBR},        // Base 4 -> Right stick button
+        {BTN_BASE5, BTN_TL2},           // Base 5 -> Left trigger button
+        {BTN_BASE6, BTN_TR2}            // Base 6 -> Right trigger button
     };
     
     for (const auto& [src_btn, dst_btn] : button_mappings) {
@@ -318,10 +293,16 @@ std::vector<Binding> make_bindings_from_config(const std::vector<BindingConfigKe
         int min_out, max_out;
         switch (config_abs.dst) {
             case ABS_X:
-            case ABS_Y:
             case ABS_RX:
+                // Centered axes for stick X (yaw/anti-torque)
+                min_out = -32768;
+                max_out = 32767;
+                break;
+            case ABS_Y:
             case ABS_RY:
-                // Standard gamepad axes: -32768 to 32767 with 0 as center
+                // Full range for all roles
+                // Throttle->ABS_Y (collective) needs full range for 0-100% in ARMA
+                // Stick->ABS_Y/RY (pitch/roll) also needs full range
                 min_out = -32768;
                 max_out = 32767;
                 break;

@@ -68,14 +68,22 @@ start:
 
 # Stop the mapper
 stop:
-	@echo "Stopping mapper service..."
-	@systemctl --user stop twcs-mapper.service 2>/dev/null || pkill -INT twcs_mapper || true
+	@echo "Stopping ALL mapper instances..."
+	@systemctl --user stop twcs-mapper.service 2>/dev/null || true
+	@pkill -INT twcs_mapper 2>/dev/null || true
+	@pkill -INT twcs_setup 2>/dev/null || true
 	@sleep 1
-	@if pgrep -x twcs_mapper > /dev/null; then \
-		echo "⚠ Mapper still running, force killing..."; \
-		pkill -9 twcs_mapper; \
+	@if pgrep -x twcs_mapper > /dev/null || pgrep -x twcs_setup > /dev/null; then \
+		echo "⚠ Processes still running, force killing..."; \
+		pkill -9 twcs_mapper 2>/dev/null || true; \
+		pkill -9 twcs_setup 2>/dev/null || true; \
+		sleep 0.5; \
+	fi
+	@if pgrep -x twcs_mapper > /dev/null || pgrep -x twcs_setup > /dev/null; then \
+		echo "✗ Failed to stop all instances"; \
+		pgrep -a twcs_mapper twcs_setup 2>/dev/null || true; \
 	else \
-		echo "✓ Mapper stopped"; \
+		echo "✓ All mapper instances stopped"; \
 	fi
 
 # Restart the mapper
@@ -95,9 +103,9 @@ status:
 	fi
 	@echo ""
 	@echo "=== Virtual Device Status ==="
-	@if [ -e /dev/input/event20 ] && grep -q "Thrustmaster ARMA Virtual" /proc/bus/input/devices 2>/dev/null; then \
+	@if grep -q "Thrustmaster ARMA Virtual" /proc/bus/input/devices 2>/dev/null; then \
 		echo "✓ Virtual controller detected:"; \
-		cat /proc/bus/input/devices | grep -A5 "Thrustmaster ARMA Virtual"; \
+		grep -A5 "Thrustmaster ARMA Virtual" /proc/bus/input/devices; \
 	else \
 		echo "✗ Virtual controller not found"; \
 	fi

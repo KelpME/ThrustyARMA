@@ -58,19 +58,19 @@ struct CaptureState {
 
 // Virtual button mappings in order
 const std::vector<int> VIRTUAL_BUTTONS = {
-    BTN_SOUTH,   // 1. A
-    BTN_EAST,    // 2. B  
-    BTN_NORTH,   // 3. X (swapped: games expect BTN_NORTH for X)
-    BTN_WEST,    // 4. Y (swapped: games expect BTN_WEST for Y)
-    BTN_TL,      // 5. Left Bumper
-    BTN_TR,      // 6. Right Bumper
+    BTN_SOUTH,   // 1. South Button
+    BTN_EAST,    // 2. East Button
+    BTN_NORTH,   // 3. North Button
+    BTN_WEST,    // 4. West Button
+    BTN_TL,      // 5. Left Shoulder
+    BTN_TR,      // 6. Right Shoulder
     BTN_TL2,     // 7. Left Trigger
     BTN_TR2,     // 8. Right Trigger
-    BTN_SELECT,  // 9. Back
+    BTN_SELECT,  // 9. Select
     BTN_START,   // 10. Start
-    BTN_MODE,    // 11. Guide
-    BTN_THUMBL,  // 12. L3
-    BTN_THUMBR,  // 13. R3
+    BTN_MODE,    // 11. Menu
+    BTN_THUMBL,  // 12. Left Stick Button
+    BTN_THUMBR,  // 13. Right Stick Button
     BTN_DPAD_UP,    // 14. D-pad Up
     BTN_DPAD_DOWN,  // 15. D-pad Down
     BTN_DPAD_LEFT,  // 16. D-pad Left
@@ -78,9 +78,9 @@ const std::vector<int> VIRTUAL_BUTTONS = {
 };
 
 const std::vector<std::string> BUTTON_NAMES = {
-    "A (South)", "B (East)", "X (West)", "Y (North)",
-    "Left Bumper", "Right Bumper", "Left Trigger", "Right Trigger",
-    "Back (Select)", "Start", "Guide", "L3 (Left Stick)", "R3 (Right Stick)",
+    "South Button", "East Button", "North Button", "West Button",
+    "Left Shoulder", "Right Shoulder", "Left Trigger", "Right Trigger",
+    "Select", "Start", "Menu", "Left Stick Button", "Right Stick Button",
     "D-pad Up", "D-pad Down", "D-pad Left", "D-pad Right"
 };
 
@@ -270,21 +270,7 @@ std::vector<DeviceInfo> detect_devices() {
             continue;
         }
         
-        // Skip keyboards and mice
-        if (libevdev_has_event_type(dev, EV_KEY) && 
-            (libevdev_has_event_code(dev, EV_KEY, KEY_A) || 
-             libevdev_has_event_code(dev, EV_KEY, BTN_LEFT))) {
-            libevdev_free(dev);
-            close(fd);
-            continue;
-        }
-        
-        // Must have at least some absolute axes to be a joystick
-        if (!libevdev_has_event_type(dev, EV_ABS)) {
-            libevdev_free(dev);
-            close(fd);
-            continue;
-        }
+        // No filtering - detect all devices with event interface
         
         DeviceInfo info;
         info.path = real_path;
@@ -293,21 +279,38 @@ std::vector<DeviceInfo> detect_devices() {
         info.dev = dev;
         info.vendor = get_udev_property(real_path, "ID_VENDOR_ID");
         info.product = get_udev_property(real_path, "ID_MODEL_ID");
-        info.role = detect_device_role(info);
+        info.role = "";  // No role assigned yet
         
         devices.push_back(info);
     }
     closedir(dir);
     
-    // Sort by preference (Thrustmaster stick first, then by role priority)
+    // Sort by preference (Thrustmaster devices first, keyboards/mice last)
     std::sort(devices.begin(), devices.end(), [](const DeviceInfo& a, const DeviceInfo& b) {
-        if (a.vendor == "044f" && a.role == "stick" && (b.vendor != "044f" || b.role != "stick")) return true;
-        if (b.vendor == "044f" && b.role == "stick" && (a.vendor != "044f" || a.role != "stick")) return false;
-        if (a.role == "stick" && b.role != "stick") return true;
-        if (b.role == "stick" && a.role != "stick") return false;
-        if (a.role == "throttle" && b.role != "throttle") return true;
-        if (b.role == "throttle" && a.role != "throttle") return false;
-        return a.role == "rudder" && b.role != "rudder";
+        // Check if device name contains "keyboard" or "mouse" (case insensitive)
+        const char* name_a = libevdev_get_name(a.dev);
+        const char* name_b = libevdev_get_name(b.dev);
+        std::string str_a = name_a ? name_a : "";
+        std::string str_b = name_b ? name_b : "";
+        
+        // Convert to lowercase for comparison
+        std::transform(str_a.begin(), str_a.end(), str_a.begin(), ::tolower);
+        std::transform(str_b.begin(), str_b.end(), str_b.begin(), ::tolower);
+        
+        bool a_is_kbd_mouse = (str_a.find("keyboard") != std::string::npos || 
+                               str_a.find("mouse") != std::string::npos);
+        bool b_is_kbd_mouse = (str_b.find("keyboard") != std::string::npos || 
+                               str_b.find("mouse") != std::string::npos);
+        
+        // Push keyboards/mice to the end
+        if (a_is_kbd_mouse && !b_is_kbd_mouse) return false;
+        if (!a_is_kbd_mouse && b_is_kbd_mouse) return true;
+        
+        // Prioritize Thrustmaster devices (vendor 044f)
+        if (a.vendor == "044f" && b.vendor != "044f") return true;
+        if (b.vendor == "044f" && a.vendor != "044f") return false;
+        
+        return false;  // Keep original order otherwise
     });
     
     return devices;
@@ -377,6 +380,25 @@ std::vector<DeviceInfo> build_devices_from_config_inputs(const Config& cfg) {
     return devices;
 }
 
+int get_smart_default_for_role(const std::vector<DeviceInfo>& devices, const std::string& role) {
+    // Smart defaults based on device names
+    for (size_t i = 0; i < devices.size(); i++) {
+        const char* name = libevdev_get_name(devices[i].dev);
+        std::string device_name = name ? name : "";
+        
+        if (role == "stick" && device_name.find("T.16000M") != std::string::npos) {
+            return i;
+        }
+        if (role == "throttle" && device_name.find("TWCS") != std::string::npos) {
+            return i;
+        }
+        if (role == "rudder" && device_name.find("T-Rudder") != std::string::npos) {
+            return i;
+        }
+    }
+    return 0;  // Default to first device
+}
+
 std::map<std::string, DeviceInfo> select_devices_per_role(const std::vector<DeviceInfo>& all_devices, const Config& cfg) {
     std::map<std::string, DeviceInfo> selected_devices;
     
@@ -389,43 +411,36 @@ std::map<std::string, DeviceInfo> select_devices_per_role(const std::vector<Devi
     std::vector<std::string> roles_to_check = {"stick", "throttle", "rudder"};
     
     for (const auto& role : roles_to_check) {
-        // Find candidate devices for this role
-        std::vector<DeviceInfo> candidates;
-        for (const auto& device : all_devices) {
-            if (device.role == role) {
-                candidates.push_back(device);
-            }
-        }
+        bool required = role_required[role];
         
-        if (candidates.empty()) {
-            bool required = role_required[role];
+        if (all_devices.empty()) {
             if (required) {
-                std::cerr << "ERROR: No " << role << " devices found! This device is required by config.\n";
+                std::cerr << "ERROR: No devices available for " << role << "! This device is required by config.\n";
                 return {};
             } else {
-                std::cout << "No " << role << " devices found (optional according to config).\n";
+                std::cout << "No devices available for " << role << " (optional according to config).\n";
                 continue;
             }
         }
         
         std::cout << "\nSelect " << role << " device:\n";
-        for (size_t i = 0; i < candidates.size(); i++) {
-            const auto& device = candidates[i];
+        for (size_t i = 0; i < all_devices.size(); i++) {
+            const auto& device = all_devices[i];
+            const char* name = libevdev_get_name(device.dev);
             std::cout << "  [" << i << "] " << device.by_id;
-            if (!device.vendor.empty() && !device.product.empty()) {
-                std::cout << " (vendor:" << device.vendor << " product:" << device.product << ")";
+            if (name) {
+                std::cout << " (" << name << ")";
             }
             std::cout << "\n";
         }
         
-        if (candidates.size() == 1) {
-            std::cout << "Enter choice [0-0] (default 0): ";
-        } else {
-            std::cout << "Enter choice [0-" << (candidates.size() - 1) << "] (default 0): ";
-        }
-        int choice = get_user_choice(static_cast<int>(candidates.size() - 1), 0);
+        int smart_default = get_smart_default_for_role(all_devices, role);
+        std::cout << "Enter choice [0-" << (all_devices.size() - 1) << "] (default " << smart_default << "): ";
+        int choice = get_user_choice(static_cast<int>(all_devices.size() - 1), smart_default);
         
-        selected_devices[role] = candidates[choice];
+        DeviceInfo selected = all_devices[choice];
+        selected.role = role;  // Assign role at selection time
+        selected_devices[role] = selected;
         std::cout << "Selected: " << selected_devices[role].by_id << "\n";
     }
     
@@ -605,7 +620,7 @@ std::optional<AxisCalibration> calibrate_detected_axis(DeviceInfo& device, int a
         sum += val;
     }
     int center_value = center_samples.empty() ? 0 : sum / center_samples.size();
-    int deadzone_radius = (center_max - center_min) / 2 + 10; // Add safety margin
+    int deadzone_radius = 10;  // Fixed deadzone for centered axes
     
     // Step 2: Measure full range
     std::cout << "  Step 2: Move " << axis_name << " through FULL range in all directions for 10 seconds...\n";
@@ -745,15 +760,118 @@ std::pair<int, std::optional<AxisCalibration>> detect_and_calibrate_throttle_axi
         return {best_code, std::nullopt};
     }
     
-    // For throttle: center is at min position, no deadzone needed
+    // For throttle: center is calculated as midpoint (not measured)
     AxisCalibration cal;
     cal.src_code = best_code;
     cal.observed_min = obs_min;
     cal.observed_max = obs_max;
-    cal.center_value = obs_min;  // Throttle "center" is at minimum position
+    cal.center_value = (obs_min + obs_max) / 2;  // Calculate midpoint
     cal.deadzone_radius = 0;       // No deadzone for throttle
     
     return {best_code, cal};
+}
+
+// Detect which axis is moving and measure ONLY its center position
+// Does NOT measure full range - that's done separately
+std::pair<int, int> detect_axis_and_center_only(DeviceInfo& device, int capture_time_ms = 3000) {
+    const int JITTER_THRESHOLD = 100;
+    const int MIN_MOVEMENT = 3000;
+    std::map<int, int> delta_sum;
+    std::map<int, std::vector<int>> center_samples;
+    std::map<int, int> baseline_values;
+    struct input_event ev;
+    
+    // Drain pending events first
+    while (libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
+        // Just drain the queue
+    }
+    
+    // Get initial values as baseline
+    for (int code = 0; code <= ABS_MAX; code++) {
+        if (libevdev_has_event_code(device.dev, EV_ABS, code)) {
+            const struct input_absinfo* absinfo = libevdev_get_abs_info(device.dev, code);
+            if (absinfo) {
+                baseline_values[code] = absinfo->value;
+                delta_sum[code] = 0;
+            }
+        }
+    }
+    
+    // Sample center values at the beginning (first 1 second while user holds still)
+    auto start = std::chrono::steady_clock::now();
+    auto center_end = start + std::chrono::milliseconds(1000);
+    
+    std::cout << "  Sampling center position (hold still)...\n";
+    while (std::chrono::steady_clock::now() < center_end) {
+        int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS) {
+            center_samples[ev.code].push_back(ev.value);
+        } else if (rc == -EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    
+    std::cout << "  Now move the axis to detect it...\n";
+    
+    // Now capture movement for remaining time (user moves the axis)
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(capture_time_ms)) {
+        int rc = libevdev_next_event(device.dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS) {
+            int baseline = baseline_values[ev.code];
+            int delta = std::abs(ev.value - baseline);
+            
+            if (delta >= JITTER_THRESHOLD) {
+                delta_sum[ev.code] += delta;
+            }
+        } else if (rc == -EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    
+    // Show all detected movement for debugging
+    std::cout << "  Movement detected:\n";
+    for (const auto& [code, delta] : delta_sum) {
+        if (delta > 0) {
+            const char* axis_name_str = libevdev_event_code_get_name(EV_ABS, code);
+            std::cout << "    Axis " << code << " (" << (axis_name_str ? axis_name_str : "UNKNOWN") 
+                     << "): " << delta << " units\n";
+        }
+    }
+    
+    // Find axis with highest delta
+    int best_code = -1;
+    int max_delta = 0;
+    for (const auto& [code, delta] : delta_sum) {
+        if (delta > max_delta) {
+            max_delta = delta;
+            best_code = code;
+        }
+    }
+    
+    // Require minimum movement
+    if (max_delta < MIN_MOVEMENT) {
+        std::cout << "  WARNING: Movement too small (" << max_delta << " < " << MIN_MOVEMENT << ")\n";
+        return {-1, 0};
+    }
+    
+    std::cout << "Detected axis code: " << best_code << "\n";
+    
+    // Calculate center value from initial samples (when user was holding still)
+    int center_value = baseline_values[best_code];
+    
+    if (!center_samples[best_code].empty()) {
+        long long sum = 0;
+        for (int val : center_samples[best_code]) {
+            sum += val;
+        }
+        center_value = sum / center_samples[best_code].size();
+    }
+    
+    std::cout << "Center value: " << center_value << "\n";
+    
+    return {best_code, center_value};
 }
 
 std::pair<int, std::optional<AxisCalibration>> detect_and_calibrate_centered_axis(DeviceInfo& device, const std::string& axis_name, int capture_time_ms = 6000, bool offer_midpoint = false) {
@@ -862,7 +980,7 @@ std::pair<int, std::optional<AxisCalibration>> detect_and_calibrate_centered_axi
         center_value = sum / center_samples[best_code].size();
     }
     
-    int deadzone_radius = (center_max - center_min) / 2 + 10;
+    int deadzone_radius = 10;  // Fixed deadzone for centered axes
     
     // Use the captured min/max from the detection phase
     int obs_min = range_min[best_code];
@@ -905,18 +1023,20 @@ std::pair<int, std::optional<AxisCalibration>> detect_and_calibrate_centered_axi
                 center_value = expected_center;
                 std::cout << "  Using calculated midpoint: " << center_value << "\n";
             } else {
-                // Default: retry
-                return {best_code, std::nullopt};
+                // Default: retry - return -1 to signal retry needed
+                return {-1, std::nullopt};
             }
         } else {
             std::cout << "\n  Retry calibration? (y/n, default y): ";
             std::string accept_input;
             std::getline(std::cin, accept_input);
-            if (!accept_input.empty() && (accept_input[0] == 'n' || accept_input[0] == 'N')) {
+            bool retry = accept_input.empty() || !(accept_input[0] == 'n' || accept_input[0] == 'N');
+            std::cout << "  → " << (retry ? "Yes" : "No") << "\n";
+            if (!retry) {
                 // Accept measured center despite warning
             } else {
-                // Default: retry
-                return {best_code, std::nullopt};
+                // Default: retry - return -1 to signal retry needed
+                return {-1, std::nullopt};
             }
         }
     }
@@ -1056,20 +1176,10 @@ std::pair<std::optional<AxisCalibration>, std::optional<AxisCalibration>> calibr
     std::cout << "  Press ENTER when ready...";
     get_line_input();
     
+    // Initialize range with center values, not current position
+    // This prevents contamination if stick isn't centered when ENTER is pressed
     int range_min1 = center_value1, range_max1 = center_value1;
     int range_min2 = center_value2, range_max2 = center_value2;
-    
-    // Get current values as starting point
-    absinfo1 = libevdev_get_abs_info(device.dev, axis1_code);
-    absinfo2 = libevdev_get_abs_info(device.dev, axis2_code);
-    if (absinfo1) {
-        range_min1 = absinfo1->value;
-        range_max1 = absinfo1->value;
-    }
-    if (absinfo2) {
-        range_min2 = absinfo2->value;
-        range_max2 = absinfo2->value;
-    }
     
     start = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(10000)) {
@@ -1130,7 +1240,9 @@ std::pair<std::optional<AxisCalibration>, std::optional<AxisCalibration>> calibr
     if (center_warning) {
         std::cout << "\n  Retry calibration? (y/n, default y): ";
         std::string retry_input = get_line_input();
-        if (retry_input.empty() || retry_input[0] == 'y' || retry_input[0] == 'Y') {
+        bool retry = retry_input.empty() || retry_input[0] == 'y' || retry_input[0] == 'Y';
+        std::cout << "  → " << (retry ? "Yes" : "No") << "\n";
+        if (retry) {
             std::cout << "  Retrying calibration...\n\n";
             return calibrate_two_axes(device, axis1_code, axis2_code, description);
         }
@@ -1139,7 +1251,9 @@ std::pair<std::optional<AxisCalibration>, std::optional<AxisCalibration>> calibr
         // Ask if user wants to retry
         std::cout << "\n  Accept these calibration values? (y/n, default y): ";
         std::string retry_input = get_line_input();
-        if (!retry_input.empty() && (retry_input[0] == 'n' || retry_input[0] == 'N')) {
+        bool accept = retry_input.empty() || !(retry_input[0] == 'n' || retry_input[0] == 'N');
+        std::cout << "  → " << (accept ? "Yes" : "No") << "\n";
+        if (!accept) {
             std::cout << "  Retrying calibration...\n\n";
             return calibrate_two_axes(device, axis1_code, axis2_code, description);
         }
@@ -1178,7 +1292,9 @@ std::pair<std::optional<AxisCalibration>, std::optional<AxisCalibration>> calibr
 bool get_invert_preference(const std::string& axis_name) {
     std::cout << "Invert " << axis_name << "? (y/n, default n): ";
     std::string input = get_line_input();
-    return (!input.empty() && (input[0] == 'y' || input[0] == 'Y'));
+    bool invert = (!input.empty() && (input[0] == 'y' || input[0] == 'Y'));
+    std::cout << "  → " << (invert ? "Yes" : "No") << "\n";
+    return invert;
 }
 
 void capture_axes(CaptureState& state) {
@@ -1300,7 +1416,9 @@ void capture_axes(CaptureState& state) {
                     std::cout << "Failed to calibrate cyclic axes\n";
                     std::cout << "Skip or restart? (s/r, default r): ";
                     std::string input = get_line_input();
-                    if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
+                    bool skip = !input.empty() && (input[0] == 's' || input[0] == 'S');
+                    std::cout << "  → " << (skip ? "Skip" : "Restart") << "\n";
+                    if (skip) {
                         std::cout << "Skipping cyclic axes\n\n";
                         cyclics_captured = true;
                     } else {
@@ -1316,7 +1434,9 @@ void capture_axes(CaptureState& state) {
             std::cout << "No movement detected. Skipping cyclic axes\n";
             std::cout << "Skip or restart? (s/r, default r): ";
             std::string input = get_line_input();
-            if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
+            bool skip = !input.empty() && (input[0] == 's' || input[0] == 'S');
+            std::cout << "  → " << (skip ? "Skip" : "Restart") << "\n";
+            if (skip) {
                 std::cout << "Skipping cyclic axes\n\n";
                 cyclics_captured = true;
             } else {
@@ -1361,7 +1481,9 @@ void capture_axes(CaptureState& state) {
                     std::cout << "Failed to calibrate COLLECTIVE\n";
                     std::cout << "Skip or restart? (s/r, default r): ";
                     std::string input = get_line_input();
-                    if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
+                    bool skip = !input.empty() && (input[0] == 's' || input[0] == 'S');
+                    std::cout << "  → " << (skip ? "Skip" : "Restart") << "\n";
+                    if (skip) {
                         std::cout << "Skipping COLLECTIVE\n\n";
                         collective_captured = true;
                     } else {
@@ -1373,7 +1495,9 @@ void capture_axes(CaptureState& state) {
                 std::cout << "No movement detected. Skipping COLLECTIVE\n";
                 std::cout << "Skip or restart? (s/r, default r): ";
                 std::string input = get_line_input();
-                if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
+                bool skip = !input.empty() && (input[0] == 's' || input[0] == 'S');
+                std::cout << "  → " << (skip ? "Skip" : "Restart") << "\n";
+                if (skip) {
                     std::cout << "Skipping COLLECTIVE\n\n";
                     collective_captured = true;
                 } else {
@@ -1399,49 +1523,101 @@ void capture_axes(CaptureState& state) {
         bool antitorque_captured = false;
         while (!antitorque_captured) {
             std::cout << "D) ANTI-TORQUE (rudder pedals)\n";
-            std::cout << "⚠ IMPORTANT: Keep rudder pedals COMPLETELY CENTERED before pressing ENTER!\n";
-            std::cout << "Press ENTER when centered, then move rudder pedals left/right...";
+            std::cout << "⚠ IMPORTANT: Keep rudder pedals COMPLETELY CENTERED!\n";
+            std::cout << "⚠ Do NOT touch the brake pedals during calibration - only move the rudder left/right!\n\n";
+            
+            // Step 1: Detect axis and measure full range
+            std::cout << "Step 1: Detecting rudder axis and measuring range\n";
+            std::cout << "Press ENTER, then move rudder pedals through FULL range (left and right)...";
             get_line_input();
             
-            auto [antitorque_code, antitorque_cal] = detect_and_calibrate_centered_axis(*rudder, "ANTI-TORQUE (rudder pedals)", 6000, true);
-            if (antitorque_code >= 0) {
-                if (antitorque_cal.has_value()) {
-                    bool invert = get_invert_preference("Anti-torque");
-                    CapturedAxis axis;
-                    axis.role = "rudder";
-                    axis.src = antitorque_cal->src_code;
-                    axis.dst = ABS_X;
-                    axis.invert = invert;
-                    axis.deadzone = antitorque_cal->deadzone_radius;
-                    axis.scale = 1.0f;
-                    axis.calibration = *antitorque_cal;
-                    state.captured_axes.push_back(axis);
-                    std::cout << "Captured ANTI-TORQUE -> virtual ABS_X(0) invert=" << invert << "\n\n";
-                    antitorque_captured = true;
-                } else {
-                    std::cout << "Failed to calibrate ANTI-TORQUE\n";
-                    std::cout << "Skip or restart? (s/r, default r): ";
-                    std::string input = get_line_input();
-                    if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
-                        std::cout << "Skipping ANTI-TORQUE\n\n";
-                        antitorque_captured = true;
-                    } else {
-                        std::cout << "Restarting ANTI-TORQUE capture...\n\n";
-                        continue;
-                    }
-                }
-            } else {
+            auto [antitorque_code, temp_cal] = detect_and_calibrate_throttle_axis(*rudder, "ANTI-TORQUE", 6000);
+            
+            if (antitorque_code < 0) {
                 std::cout << "No movement detected. Skipping ANTI-TORQUE\n";
                 std::cout << "Skip or restart? (s/r, default r): ";
                 std::string input = get_line_input();
-                if (!input.empty() && (input[0] == 's' || input[0] == 'S')) {
+                bool skip = !input.empty() && (input[0] == 's' || input[0] == 'S');
+                std::cout << "  → " << (skip ? "Skip" : "Restart") << "\n";
+                if (skip) {
                     std::cout << "Skipping ANTI-TORQUE\n\n";
                     antitorque_captured = true;
                 } else {
                     std::cout << "Restarting ANTI-TORQUE capture...\n\n";
                     continue;
                 }
+                continue;
             }
+            
+            if (!temp_cal.has_value()) {
+                std::cout << "Failed to detect axis. Restarting...\n\n";
+                continue;
+            }
+            
+            std::cout << "\nDetected axis: " << antitorque_code << "\n";
+            std::cout << "Observed MIN: " << temp_cal->observed_min << "\n";
+            std::cout << "Observed MAX: " << temp_cal->observed_max << "\n";
+            
+            // Step 2: Measure center with known axis
+            std::cout << "\nStep 2: Measuring center position\n";
+            std::cout << "CENTER the rudder pedals and hold still for 5 seconds...\n";
+            std::cout << "Press ENTER when ready...";
+            get_line_input();
+            
+            // Sample center for 5 seconds
+            struct input_event ev;
+            while (libevdev_next_event(rudder->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {
+                // Drain queue
+            }
+            
+            std::vector<int> center_samples;
+            auto start = std::chrono::steady_clock::now();
+            while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(5000)) {
+                int rc = libevdev_next_event(rudder->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+                if (rc == LIBEVDEV_READ_STATUS_SUCCESS && ev.type == EV_ABS && ev.code == antitorque_code) {
+                    center_samples.push_back(ev.value);
+                } else if (rc == -EAGAIN) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+            
+            int center_value = temp_cal->center_value;
+            if (!center_samples.empty()) {
+                long long sum = 0;
+                for (int val : center_samples) {
+                    sum += val;
+                }
+                center_value = sum / center_samples.size();
+            }
+            
+            std::cout << "Center value: " << center_value << "\n";
+            std::cout << "\nAccept these values? (y/n, default y): ";
+            std::string accept = get_line_input();
+            bool accept_ok = accept.empty() || !(accept[0] == 'n' || accept[0] == 'N');
+            std::cout << "  → " << (accept_ok ? "Yes" : "No") << "\n";
+            
+            if (!accept_ok) {
+                std::cout << "Restarting rudder calibration...\n\n";
+                continue;
+            }
+            
+            // Build final calibration
+            AxisCalibration antitorque_cal = *temp_cal;
+            antitorque_cal.center_value = center_value;
+            antitorque_cal.deadzone_radius = 10;
+            
+            bool invert = get_invert_preference("Anti-torque");
+            CapturedAxis axis;
+            axis.role = "rudder";
+            axis.src = antitorque_cal.src_code;
+            axis.dst = ABS_X;
+            axis.invert = invert;
+            axis.deadzone = antitorque_cal.deadzone_radius;
+            axis.scale = 1.0f;
+            axis.calibration = antitorque_cal;
+            state.captured_axes.push_back(axis);
+            std::cout << "Captured ANTI-TORQUE -> virtual ABS_X(0) invert=" << invert << "\n\n";
+            antitorque_captured = true;
         }
     } else {
         std::cout << "D) ANTI-TORQUE - no rudder device found, skipping\n\n";
@@ -1746,11 +1922,13 @@ int main() {
         return 1;
     }
     
-    std::cout << "\nAvailable devices for selection:\n";
-    for (const auto& device : all_devices) {
-        std::cout << "  " << device.role << ": " << device.by_id;
-        if (!device.vendor.empty() && !device.product.empty()) {
-            std::cout << " (vendor:" << device.vendor << " product:" << device.product << ")";
+    std::cout << "\nDetected " << all_devices.size() << " device(s):\n";
+    for (size_t i = 0; i < all_devices.size(); i++) {
+        const auto& device = all_devices[i];
+        const char* name = libevdev_get_name(device.dev);
+        std::cout << "  [" << i << "] " << device.by_id;
+        if (name) {
+            std::cout << " (" << name << ")";
         }
         std::cout << "\n";
     }
@@ -1765,14 +1943,14 @@ int main() {
     }
     
     // Close and free unselected devices to avoid resource leaks
-    std::set<std::string> selected_roles;
+    std::set<std::string> selected_paths;
     for (const auto& [role, device] : selected_devices) {
-        selected_roles.insert(role);
+        selected_paths.insert(device.path);
     }
     
     for (auto& device : all_devices) {
-        if (selected_roles.find(device.role) == selected_roles.end()) {
-            std::cout << "Closing unselected " << device.role << ": " << device.by_id << "\n";
+        if (selected_paths.find(device.path) == selected_paths.end()) {
+            std::cout << "Closing unselected: " << device.by_id << "\n";
             libevdev_free(device.dev);
             close(device.fd);
         }
@@ -1826,17 +2004,10 @@ int main() {
                 }
             }
             
-            // Clear previous captures
-            state.captured_axes.clear();
+            // Clear only button captures (keep axes)
             state.captured_buttons.clear();
             
-            // Redo capture phases
-            capture_axes(state);
-            if (state.abort) {
-                std::cerr << state.abort_reason << "\n";
-                return 1;
-            }
-            
+            // Redo only button capture
             capture_buttons(state);
             if (state.abort) {
                 std::cerr << state.abort_reason << "\n";

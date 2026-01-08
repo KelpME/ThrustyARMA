@@ -39,17 +39,17 @@ static const std::map<std::pair<int, InputType>, SlotLabel> SLOT_LABELS = {
     {{ABS_HAT0Y, InputType::ABS}, {"DPad Y", "D-Pad Y"}},
     
     // Buttons
-    {{BTN_SOUTH, InputType::KEY}, {"A", "A Button"}},
-    {{BTN_EAST, InputType::KEY}, {"B", "B Button"}},
-    {{BTN_WEST, InputType::KEY}, {"X", "X Button"}},
-    {{BTN_NORTH, InputType::KEY}, {"Y", "Y Button"}},
-    {{BTN_TL, InputType::KEY}, {"LB", "Left Bumper"}},
-    {{BTN_TR, InputType::KEY}, {"RB", "Right Bumper"}},
-    {{BTN_SELECT, InputType::KEY}, {"Back", "Back / Select"}},
+    {{BTN_SOUTH, InputType::KEY}, {"South", "South Button"}},
+    {{BTN_EAST, InputType::KEY}, {"East", "East Button"}},
+    {{BTN_WEST, InputType::KEY}, {"West", "West Button"}},
+    {{BTN_NORTH, InputType::KEY}, {"North", "North Button"}},
+    {{BTN_TL, InputType::KEY}, {"L Shoulder", "Left Shoulder"}},
+    {{BTN_TR, InputType::KEY}, {"R Shoulder", "Right Shoulder"}},
+    {{BTN_SELECT, InputType::KEY}, {"Select", "Select"}},
     {{BTN_START, InputType::KEY}, {"Start", "Start"}},
-    {{BTN_MODE, InputType::KEY}, {"Guide", "Guide"}},
-    {{BTN_THUMBL, InputType::KEY}, {"L3", "Left Stick Click (L3)"}},
-    {{BTN_THUMBR, InputType::KEY}, {"R3", "Right Stick Click (R3)"}}
+    {{BTN_MODE, InputType::KEY}, {"Menu", "Menu"}},
+    {{BTN_THUMBL, InputType::KEY}, {"L Stick Btn", "Left Stick Button"}},
+    {{BTN_THUMBR, InputType::KEY}, {"R Stick Btn", "Right Stick Button"}}
 };
 
 std::string get_slot_label(int code, InputType type, bool use_long = false) {
