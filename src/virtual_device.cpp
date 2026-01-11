@@ -78,11 +78,11 @@ bool VirtualDevice::enable_event_types() {
 bool VirtualDevice::enable_buttons() {
     // Virtual Controller Contract: Fixed 17 buttons for ARMA stability
     const int virtual_buttons[] = {
-        BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH,  // Face buttons (South/East/West/North)
-        BTN_TL, BTN_TR,                              // Shoulder buttons
-        BTN_TL2, BTN_TR2,                            // Trigger buttons (digital clicks)
-        BTN_SELECT, BTN_START, BTN_MODE,             // System buttons
-        BTN_THUMBL, BTN_THUMBR,                      // Stick buttons
+        BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST,  // Face buttons (A/B/X/Y: South/East/North/West)
+        BTN_TL, BTN_TR,                            // Shoulder buttons
+        BTN_TL2, BTN_TR2,                          // Trigger click buttons
+        BTN_SELECT, BTN_START, BTN_MODE,           // System buttons
+        BTN_THUMBL, BTN_THUMBR,                    // Stick buttons
         BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT  // D-pad buttons
     };
     
@@ -100,7 +100,7 @@ bool VirtualDevice::enable_axes() {
     const int virtual_axes[] = {
         ABS_X, ABS_Y,        // Left stick
         ABS_RX, ABS_RY,      // Right stick  
-        ABS_Z, ABS_RZ,       // Analog triggers (no digital clicks)
+        ABS_Z, ABS_RZ,       // Analog triggers
         ABS_HAT0X, ABS_HAT0Y // D-pad hat
     };
     

@@ -1,0 +1,184 @@
+{
+  "uinput_name": "Thrustmaster ARMA Virtual",
+  "grab": true,
+  "inputs": [
+    {
+      "role": "rudder",
+      "by_id": "/dev/input/by-id/usb-Thrustmaster_T-Rudder_00000000001A-event-if00",
+      "vendor": "044f",
+      "product": "b679",
+      "optional": true,
+      "calibrations": [
+        {
+          "src_code": 2,
+          "observed_min": 0,
+          "observed_max": 1023,
+          "center_value": 511,
+          "deadzone_radius": 10
+        }
+      ]
+    },
+    {
+      "role": "stick",
+      "by_id": "/dev/input/by-id/usb-Thrustmaster_T.16000M-event-joystick",
+      "vendor": "044f",
+      "product": "b10a",
+      "optional": false,
+      "calibrations": [
+        {
+          "src_code": 0,
+          "observed_min": 0,
+          "observed_max": 16383,
+          "center_value": 8192,
+          "deadzone_radius": 10
+        },
+        {
+          "src_code": 1,
+          "observed_min": 0,
+          "observed_max": 16383,
+          "center_value": 8239,
+          "deadzone_radius": 10
+        }
+      ]
+    },
+    {
+      "role": "throttle",
+      "by_id": "/dev/input/by-id/usb-Thrustmaster_TWCS_Throttle-event-joystick",
+      "vendor": "044f",
+      "product": "b687",
+      "optional": true,
+      "calibrations": [
+        {
+          "src_code": 2,
+          "observed_min": 0,
+          "observed_max": 65535,
+          "center_value": 32767,
+          "deadzone_radius": 0
+        }
+      ]
+    }
+  ],
+  "bindings": {
+    "keys": [
+      {
+        "role": "throttle",
+        "src": 289,
+        "dst": 304
+      },
+      {
+        "role": "throttle",
+        "src": 290,
+        "dst": 305
+      },
+      {
+        "role": "throttle",
+        "src": 292,
+        "dst": 308
+      },
+      {
+        "role": "throttle",
+        "src": 291,
+        "dst": 307
+      },
+      {
+        "role": "throttle",
+        "src": 294,
+        "dst": 310
+      },
+      {
+        "role": "throttle",
+        "src": 296,
+        "dst": 311
+      },
+      {
+        "role": "stick",
+        "src": 290,
+        "dst": 312
+      },
+      {
+        "role": "stick",
+        "src": 288,
+        "dst": 313
+      },
+      {
+        "role": "stick",
+        "src": 298,
+        "dst": 314
+      },
+      {
+        "role": "stick",
+        "src": 300,
+        "dst": 315
+      },
+      {
+        "role": "stick",
+        "src": 299,
+        "dst": 316
+      },
+      {
+        "role": "stick",
+        "src": 289,
+        "dst": 317
+      },
+      {
+        "role": "stick",
+        "src": 291,
+        "dst": 318
+      },
+      {
+        "role": "throttle",
+        "src": 298,
+        "dst": 544
+      },
+      {
+        "role": "throttle",
+        "src": 300,
+        "dst": 545
+      },
+      {
+        "role": "throttle",
+        "src": 301,
+        "dst": 546
+      },
+      {
+        "role": "throttle",
+        "src": 299,
+        "dst": 547
+      }
+    ],
+    "abs": [
+      {
+        "role": "stick",
+        "src": 0,
+        "dst": 3,
+        "invert": false,
+        "deadzone": 10,
+        "scale": 1
+      },
+      {
+        "role": "stick",
+        "src": 1,
+        "dst": 4,
+        "invert": false,
+        "deadzone": 10,
+        "scale": 1
+      },
+      {
+        "role": "throttle",
+        "src": 2,
+        "dst": 1,
+        "invert": false,
+        "deadzone": 0,
+        "scale": 1
+      },
+      {
+        "role": "rudder",
+        "src": 2,
+        "dst": 0,
+        "invert": false,
+        "deadzone": 10,
+        "scale": 1
+      }
+    ]
+  }
+}

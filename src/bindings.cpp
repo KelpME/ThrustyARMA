@@ -18,7 +18,8 @@ bool BindingResolver::is_virtual_slot_valid(const VirtualSlot& slot) const {
         BTN_SOUTH, BTN_EAST, BTN_WEST, BTN_NORTH,
         BTN_TL, BTN_TR, BTN_TL2, BTN_TR2,
         BTN_SELECT, BTN_START, BTN_MODE,
-        BTN_THUMBL, BTN_THUMBR
+        BTN_THUMBL, BTN_THUMBR,
+        BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT
     };
     
     static const std::unordered_set<uint16_t> valid_axes = {
@@ -147,29 +148,101 @@ std::vector<std::pair<VirtualSlot, int>> BindingResolver::get_pending_events() {
     std::vector<std::pair<VirtualSlot, int>> events;
     std::set<VirtualSlot> emitted_slots; // Track to prevent duplicates
     
+    auto should_suppress_button_output = [&](const VirtualSlot& slot) {
+        // For Xbox-style controllers, triggers should be axes.
+        // Some games (including ARMA) may interpret BTN_TL2/BTN_TR2 as system/menu buttons.
+        // We still use these internally as "trigger clicks", but we suppress emitting them as EV_KEY.
+        return slot.kind == SrcKind::Key && (slot.code == BTN_TL2 || slot.code == BTN_TR2);
+    };
+
     for (const auto& [slot, refcount] : button_refcounts) {
         // Safety: Skip invalid slots
         if (!is_virtual_slot_valid(slot)) {
             DEBUG_LOG("Skipping invalid button slot: kind=%d code=%d\n", static_cast<int>(slot.kind), slot.code);
             continue;
         }
-        
+
         // Safety: Skip duplicate slots
         if (emitted_slots.count(slot)) {
             DEBUG_LOG("Skipping duplicate button slot: kind=%d code=%d\n", static_cast<int>(slot.kind), slot.code);
             continue;
         }
-        
+
         int last_value = last_output_values.count(slot) ? last_output_values[slot] : 0;
         int current_value = (refcount > 0) ? 1 : 0;
-        
-        if (last_value != current_value) {
-            events.push_back({slot, current_value});
-            last_output_values[slot] = current_value;
-            emitted_slots.insert(slot);
-            DEBUG_LOG("Button event: slot=%d value=%d\n", slot.code, current_value);
+
+        if (last_value == current_value) {
+            continue;
+        }
+
+        // Always update state so we don't repeatedly "re-detect" changes.
+        last_output_values[slot] = current_value;
+
+        if (should_suppress_button_output(slot)) {
+            continue;
+        }
+
+        events.push_back({slot, current_value});
+        emitted_slots.insert(slot);
+        DEBUG_LOG("Button event: slot=%d value=%d\n", slot.code, current_value);
+    }
+    
+    // Mirror button-style inputs into axis-style outputs for games expecting axes.
+    //
+    // This is especially important for:
+    // - D-pad: some games only read the hat axes (ABS_HAT0X/ABS_HAT0Y)
+    // - Triggers: some games only read the analog trigger axes (ABS_Z/ABS_RZ)
+
+    auto get_button_pressed = [&](uint16_t btn_code) -> bool {
+        VirtualSlot btn_slot{SrcKind::Key, btn_code};
+        return button_refcounts.count(btn_slot) ? (button_refcounts[btn_slot] > 0) : false;
+    };
+
+    auto mirror_button_to_axis = [&](uint16_t btn_code, uint16_t axis_code, int pressed_value, int released_value) {
+        if (!get_button_pressed(btn_code)) {
+            pressed_value = released_value;
+        }
+
+        VirtualSlot axis_slot{SrcKind::Abs, axis_code};
+        if (!is_virtual_slot_valid(axis_slot)) {
+            return;
+        }
+
+        // Put mirrored values in the lowest-priority role so they never override
+        // any real axis mappings coming from stick/throttle.
+        auto& role_values = axis_values[axis_slot];
+        role_values[Role::Rudder] = pressed_value;
+    };
+
+    // D-pad buttons -> hat axes
+    // Linux hat convention: X left=-1 right=+1, Y up=-1 down=+1
+    int hat_x = 0;
+    if (get_button_pressed(BTN_DPAD_LEFT)) hat_x = -1;
+    if (get_button_pressed(BTN_DPAD_RIGHT)) hat_x = 1;
+
+    int hat_y = 0;
+    if (get_button_pressed(BTN_DPAD_UP)) hat_y = -1;
+    if (get_button_pressed(BTN_DPAD_DOWN)) hat_y = 1;
+
+    {
+        VirtualSlot axis_slot{SrcKind::Abs, ABS_HAT0X};
+        if (is_virtual_slot_valid(axis_slot)) {
+            auto& role_values = axis_values[axis_slot];
+            role_values[Role::Rudder] = hat_x;
         }
     }
+
+    {
+        VirtualSlot axis_slot{SrcKind::Abs, ABS_HAT0Y};
+        if (is_virtual_slot_valid(axis_slot)) {
+            auto& role_values = axis_values[axis_slot];
+            role_values[Role::Rudder] = hat_y;
+        }
+    }
+
+    // Trigger click buttons -> trigger axes
+    mirror_button_to_axis(BTN_TL2, ABS_Z, 255, 0);
+    mirror_button_to_axis(BTN_TR2, ABS_RZ, 255, 0);
     
     for (const auto& [slot, role_values] : axis_values) {
         // Safety: Skip invalid slots
@@ -187,19 +260,32 @@ std::vector<std::pair<VirtualSlot, int>> BindingResolver::get_pending_events() {
         Role selected_role = Role::Stick;
         bool has_value = false;
         
+        auto role_value = [&](Role role) -> const std::optional<int>* {
+            auto it = role_values.find(role);
+            if (it == role_values.end()) {
+                return nullptr;
+            }
+            return &it->second;
+        };
+
         // Priority: Stick > Throttle > Rudder
-        if (role_values.at(Role::Stick).has_value()) {
+        if (const auto* v = role_value(Role::Stick); v && v->has_value()) {
             selected_role = Role::Stick;
             has_value = true;
-        } else if (role_values.at(Role::Throttle).has_value()) {
+        } else if (const auto* v = role_value(Role::Throttle); v && v->has_value()) {
             selected_role = Role::Throttle;
             has_value = true;
-        } else if (role_values.at(Role::Rudder).has_value()) {
+        } else if (const auto* v = role_value(Role::Rudder); v && v->has_value()) {
             selected_role = Role::Rudder;
             has_value = true;
         }
-        
-        int current_value = has_value ? *role_values.at(selected_role) : 0;
+
+        int current_value = 0;
+        if (has_value) {
+            if (const auto* v = role_value(selected_role); v && v->has_value()) {
+                current_value = **v;
+            }
+        }
         int last_value = last_output_values.count(slot) ? last_output_values[slot] : 0;
         
         if (last_value != current_value) {
@@ -240,8 +326,8 @@ std::vector<Binding> make_default_bindings() {
         // Primary heli controls (face buttons, shoulders, system)
         {BTN_TRIGGER, BTN_SOUTH},      // Primary trigger -> South button
         {BTN_THUMB, BTN_EAST},          // Thumb button -> East button
-        {BTN_THUMB2, BTN_WEST},         // Thumb 2 -> West button
-        {BTN_TOP, BTN_NORTH},           // Top button -> North button
+        {BTN_THUMB2, BTN_NORTH},        // Thumb 2 -> X button (left)
+        {BTN_TOP, BTN_WEST},            // Top button -> Y button (top)
         {BTN_TOP2, BTN_TL},             // Top 2 -> Left shoulder
         {BTN_PINKIE, BTN_TR},           // Pinkie -> Right shoulder
         {BTN_BASE, BTN_SELECT},         // Base -> Select
@@ -250,8 +336,8 @@ std::vector<Binding> make_default_bindings() {
         // Triggers and auxiliary controls
         {BTN_BASE3, BTN_THUMBL},        // Base 3 -> Left stick button
         {BTN_BASE4, BTN_THUMBR},        // Base 4 -> Right stick button
-        {BTN_BASE5, BTN_TL2},           // Base 5 -> Left trigger button
-        {BTN_BASE6, BTN_TR2}            // Base 6 -> Right trigger button
+        {BTN_BASE5, BTN_TL2},           // Base 5 -> Left trigger click
+        {BTN_BASE6, BTN_TR2}            // Base 6 -> Right trigger click
     };
     
     for (const auto& [src_btn, dst_btn] : button_mappings) {

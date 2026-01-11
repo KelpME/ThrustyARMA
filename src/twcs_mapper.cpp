@@ -206,7 +206,14 @@ void validate_and_filter_bindings(std::vector<Binding>& bindings, const std::vec
             }
         }
         
-        if (source_device && source_device->dev) {
+        if (!source_device) {
+            // Role device not available/configured
+            binding_valid = false;
+        } else if (!source_device->dev) {
+            // Device exists but isn't opened in this context (e.g. diagnostics mode).
+            // Keep binding since we can't validate capabilities here.
+            binding_valid = true;
+        } else {
             // Check if device supports the source code
             if (!device_supports_code(*source_device, it->src.kind, it->src.code)) {
                 auto missing_key = std::make_tuple(source_device->role, it->src.kind, it->src.code);
@@ -217,8 +224,8 @@ void validate_and_filter_bindings(std::vector<Binding>& bindings, const std::vec
                     const char* code_name = libevdev_event_code_get_name(
                         it->src.kind == SrcKind::Key ? EV_KEY : EV_ABS, it->src.code);
                     
-                    std::cout << "WARNING: " << source_device->role << " device does not support " 
-                              << type_name << " " << (code_name ? code_name : "UNKNOWN") 
+                    std::cout << "WARNING: " << source_device->role << " device does not support "
+                              << type_name << " " << (code_name ? code_name : "UNKNOWN")
                               << " (" << it->src.code << "). Skipping binding.\n";
                     
                     logged_missing_codes.insert(missing_key);
@@ -226,9 +233,6 @@ void validate_and_filter_bindings(std::vector<Binding>& bindings, const std::vec
                 
                 binding_valid = false;
             }
-        } else {
-            // Device not available - skip binding but don't log (device validation handles this)
-            binding_valid = false;
         }
         
         if (!binding_valid) {
@@ -783,8 +787,8 @@ int diag_axes_mode(const Config& config) {
             std::string virtual_button_name;
             if (binding.dst.code == BTN_SOUTH) virtual_button_name = "South Button";
             else if (binding.dst.code == BTN_EAST) virtual_button_name = "East Button";
-            else if (binding.dst.code == BTN_WEST) virtual_button_name = "West Button";
-            else if (binding.dst.code == BTN_NORTH) virtual_button_name = "North Button";
+            else if (binding.dst.code == BTN_NORTH) virtual_button_name = "X (Left)";
+            else if (binding.dst.code == BTN_WEST) virtual_button_name = "Y (Top)";
             else if (binding.dst.code == BTN_TL) virtual_button_name = "Left Shoulder";
             else if (binding.dst.code == BTN_TR) virtual_button_name = "Right Shoulder";
             else if (binding.dst.code == BTN_SELECT) virtual_button_name = "Select";
@@ -922,8 +926,8 @@ int diag_axes_mode(const Config& config) {
                             // Map virtual button codes to generic controller names
                             if (binding.dst.code == BTN_SOUTH) virtual_button_name = "South Button";
                             else if (binding.dst.code == BTN_EAST) virtual_button_name = "East Button";
-                            else if (binding.dst.code == BTN_WEST) virtual_button_name = "West Button";
-                            else if (binding.dst.code == BTN_NORTH) virtual_button_name = "North Button";
+                            else if (binding.dst.code == BTN_NORTH) virtual_button_name = "X (Left)";
+                            else if (binding.dst.code == BTN_WEST) virtual_button_name = "Y (Top)";
                             else if (binding.dst.code == BTN_TL) virtual_button_name = "Left Shoulder";
                             else if (binding.dst.code == BTN_TR) virtual_button_name = "Right Shoulder";
                             else if (binding.dst.code == BTN_SELECT) virtual_button_name = "Select";
@@ -1222,8 +1226,7 @@ int main(int argc, char* argv[]) {
 
     // Main event loop - Virtual Controller Contract must remain fixed
     // Axes: 8 (ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y)
-    // Buttons: 11 (Face 4, Shoulders 2, System 3, Stick clicks 2)
-    // NO digital triggers - analog only
+    // Buttons: 17 (Face 4, Shoulders 2, Triggers 2, System 3, Stick clicks 2, D-pad 4)
     struct epoll_event events[8];
     bool events_written = false;
     

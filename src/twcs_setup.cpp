@@ -24,6 +24,7 @@
 #include <poll.h>
 #include <set>
 #include <filesystem>
+#include <climits>
 
 struct DeviceInfo {
     std::string path;
@@ -56,16 +57,16 @@ struct CaptureState {
     std::string abort_reason;
 };
 
-// Virtual button mappings in order
+// Virtual button mappings in order (fixed contract)
 const std::vector<int> VIRTUAL_BUTTONS = {
-    BTN_SOUTH,   // 1. South Button
-    BTN_EAST,    // 2. East Button
-    BTN_NORTH,   // 3. North Button
-    BTN_WEST,    // 4. West Button
+    BTN_SOUTH,   // 1. South Button (A)
+    BTN_EAST,    // 2. East Button (B)
+    BTN_NORTH,   // 3. X Button (Left)  (Linux BTN_X alias)
+    BTN_WEST,    // 4. Y Button (Top)   (Linux BTN_Y alias)
     BTN_TL,      // 5. Left Shoulder
     BTN_TR,      // 6. Right Shoulder
-    BTN_TL2,     // 7. Left Trigger
-    BTN_TR2,     // 8. Right Trigger
+    BTN_TL2,     // 7. Left Trigger Click
+    BTN_TR2,     // 8. Right Trigger Click
     BTN_SELECT,  // 9. Select
     BTN_START,   // 10. Start
     BTN_MODE,    // 11. Menu
@@ -78,8 +79,8 @@ const std::vector<int> VIRTUAL_BUTTONS = {
 };
 
 const std::vector<std::string> BUTTON_NAMES = {
-    "South Button", "East Button", "North Button", "West Button",
-    "Left Shoulder", "Right Shoulder", "Left Trigger", "Right Trigger",
+    "South (A)", "East (B)", "X (Left)", "Y (Top)",
+    "Left Shoulder", "Right Shoulder", "Left Trigger Click", "Right Trigger Click",
     "Select", "Start", "Menu", "Left Stick Button", "Right Stick Button",
     "D-pad Up", "D-pad Down", "D-pad Left", "D-pad Right"
 };
@@ -1632,7 +1633,9 @@ void capture_buttons(CaptureState& state) {
     }
     std::cout << "\nControls: 's' to skip current button, 'r' to restart Phase 2, ENTER to accept detected button\n\n";
     
-    state.captured_buttons.clear();
+    // IMPORTANT: Keep indices aligned with VIRTUAL_BUTTONS.
+    // If the user skips a prompt, we must NOT shift later captures.
+    state.captured_buttons.assign(VIRTUAL_BUTTONS.size(), {"", -1});
     
     for (size_t i = 0; i < VIRTUAL_BUTTONS.size(); i++) {
         bool restart_phase = false;
@@ -1655,6 +1658,7 @@ void capture_buttons(CaptureState& state) {
                 if (c == 's' || c == 'S') {
                     std::cout << "SKIPPED\n";
                     set_nonblocking(false);
+                    // Leave placeholder {"", -1} at this index.
                     has_detection = false;
                     break;
                 } else if (c == 'r' || c == 'R') {
@@ -1666,7 +1670,7 @@ void capture_buttons(CaptureState& state) {
                 } else if (c == '\r' || c == '\n') {
                     if (has_detection) {
                         std::cout << "ACCEPTED\n";
-                        state.captured_buttons.push_back({captured_device, captured_code});
+                        state.captured_buttons[i] = {captured_device, captured_code};
                         
                         // Drain all pending events from all devices before moving to next button
                         for (auto& dev : state.devices) {
@@ -1721,7 +1725,7 @@ void capture_buttons(CaptureState& state) {
             set_nonblocking(false);
             
             if (restart_phase) {
-                state.captured_buttons.clear();
+                state.captured_buttons.assign(VIRTUAL_BUTTONS.size(), {"", -1});
                 i = -1; // Will increment to 0 in outer loop
                 break;
             }
@@ -1737,7 +1741,11 @@ void capture_buttons(CaptureState& state) {
         }
     }
     
-    std::cout << "\nCaptured " << state.captured_buttons.size() << " out of " << VIRTUAL_BUTTONS.size() << " buttons\n";
+    size_t captured_count = 0;
+    for (const auto& [role, code] : state.captured_buttons) {
+        if (!role.empty() && code >= 0) captured_count++;
+    }
+    std::cout << "\nCaptured " << captured_count << " out of " << VIRTUAL_BUTTONS.size() << " buttons\n";
 }
 
 bool write_config(const CaptureState& state, const Config& existing_config) {
@@ -1770,11 +1778,16 @@ bool write_config(const CaptureState& state, const Config& existing_config) {
     // Update bindings
     config.bindings_keys.clear();
     for (size_t i = 0; i < state.captured_buttons.size() && i < VIRTUAL_BUTTONS.size(); i++) {
+        const auto& [role, src] = state.captured_buttons[i];
+        if (role.empty() || src < 0) {
+            continue; // skipped
+        }
+
         BindingConfigKey binding;
-        binding.role = state.captured_buttons[i].first;
-        binding.src = state.captured_buttons[i].second;
+        binding.role = role;
+        binding.src = src;
         binding.dst = VIRTUAL_BUTTONS[i];
-        
+
         config.bindings_keys.push_back(binding);
     }
     
@@ -1857,10 +1870,18 @@ void print_summary(const CaptureState& state) {
         std::cout << "\n";
     }
     
-    std::cout << "\nCaptured " << state.captured_buttons.size() << " button bindings\n";
+    size_t captured_count = 0;
+    for (const auto& [role, code] : state.captured_buttons) {
+        if (!role.empty() && code >= 0) captured_count++;
+    }
+
+    std::cout << "\nCaptured " << captured_count << " button bindings\n";
     for (size_t i = 0; i < state.captured_buttons.size() && i < BUTTON_NAMES.size(); i++) {
-        std::cout << "  " << state.captured_buttons[i].first << " " << state.captured_buttons[i].second 
-                 << " -> " << BUTTON_NAMES[i] << "\n";
+        const auto& [role, code] = state.captured_buttons[i];
+        if (role.empty() || code < 0) {
+            continue;
+        }
+        std::cout << "  " << role << " " << code << " -> " << BUTTON_NAMES[i] << "\n";
     }
 }
 

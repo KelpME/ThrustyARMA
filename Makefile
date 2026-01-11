@@ -28,16 +28,29 @@ build:
 	@echo "Building twcs_mapper..."
 	@./build.sh build
 
-# Install systemd service
+BIN_DIR := $(HOME)/.local/bin
+SYSTEMD_USER_DIR := $(HOME)/.config/systemd/user
+
+# Install systemd service + binaries
 install: build
+	@echo "Installing binaries to $(BIN_DIR)..."
+	@mkdir -p "$(BIN_DIR)"
+	@cp -f build/bin/twcs_mapper "$(BIN_DIR)/"
+	@cp -f build/bin/twcs_select "$(BIN_DIR)/" 2>/dev/null || true
+	@cp -f build/bin/twcs_setup "$(BIN_DIR)/" 2>/dev/null || true
+	@cp -f build/bin/twcs_config "$(BIN_DIR)/" 2>/dev/null || true
+	@chmod +x "$(BIN_DIR)/twcs_mapper" 2>/dev/null || true
+	@chmod +x "$(BIN_DIR)/twcs_select" 2>/dev/null || true
+	@chmod +x "$(BIN_DIR)/twcs_setup" 2>/dev/null || true
+	@chmod +x "$(BIN_DIR)/twcs_config" 2>/dev/null || true
 	@echo "Installing systemd service..."
-	@mkdir -p ~/.config/systemd/user
-	@cp twcs-mapper.service ~/.config/systemd/user/
+	@mkdir -p "$(SYSTEMD_USER_DIR)"
+	@cp twcs-mapper.service "$(SYSTEMD_USER_DIR)/"
 	@systemctl --user daemon-reload
 	@systemctl --user enable twcs-mapper.service
 	@echo ""
-	@echo "✓ Service installed and enabled for auto-start"
-	@echo "  Run 'make start' to start the service now"
+	@echo "✓ Service + binaries installed"
+	@echo "  Run 'make restart' to apply now"
 
 # Uninstall systemd service
 uninstall:
@@ -48,8 +61,8 @@ uninstall:
 	@systemctl --user daemon-reload
 	@echo "✓ Service uninstalled"
 
-# Reinstall: rebuild and restart
-reinstall: build stop
+# Reinstall: rebuild, install, restart
+reinstall: stop install
 	@echo "Restarting mapper with new build..."
 	@sleep 1
 	@$(MAKE) start
