@@ -17,7 +17,9 @@ help:
 	@echo "  make restart       - Restart the mapper service"
 	@echo "  make status        - Show service status"
 	@echo ""
-	@echo "  make setup         - Run calibration wizard to configure devices"
+	@echo "  make setup         - Run ORIGINAL calibration/setup wizard"
+	@echo "  make tui           - Launch comprehensive TUI interface"
+	@echo "  make calibrate     - Quick TUI calibration wizard (F3 in TUI)"
 	@echo "  make watch-inputs  - Watch real-time axis movements (Ctrl+C to exit)"
 	@echo "  make diag          - Run full diagnostics"
 	@echo ""
@@ -39,10 +41,12 @@ install: build
 	@cp -f build/bin/twcs_select "$(BIN_DIR)/" 2>/dev/null || true
 	@cp -f build/bin/twcs_setup "$(BIN_DIR)/" 2>/dev/null || true
 	@cp -f build/bin/twcs_config "$(BIN_DIR)/" 2>/dev/null || true
+	@cp -f build/bin/twcs_tui "$(BIN_DIR)/" 2>/dev/null || true
 	@chmod +x "$(BIN_DIR)/twcs_mapper" 2>/dev/null || true
 	@chmod +x "$(BIN_DIR)/twcs_select" 2>/dev/null || true
 	@chmod +x "$(BIN_DIR)/twcs_setup" 2>/dev/null || true
 	@chmod +x "$(BIN_DIR)/twcs_config" 2>/dev/null || true
+	@chmod +x "$(BIN_DIR)/twcs_tui" 2>/dev/null || true
 	@echo "Installing systemd service..."
 	@mkdir -p "$(SYSTEMD_USER_DIR)"
 	@cp twcs-mapper.service "$(SYSTEMD_USER_DIR)/"
@@ -137,6 +141,20 @@ setup: build
 	@echo "This will guide you through calibrating your devices"
 	@echo ""
 	@./build/bin/twcs_setup
+
+# Launch comprehensive TUI
+tui: build
+	@echo "=== Launching TUI ==="
+	@echo "Press F1-F5 to switch views, q to quit"
+	@echo ""
+	@./build/bin/twcs_tui
+
+# Quick TUI calibration wizard (launches directly to calibration view)
+calibrate: build
+	@echo "=== Quick Calibration ==="
+	@echo "Launching TUI calibration wizard..."
+	@echo ""
+	@./build/bin/twcs_tui --calibrate
 
 # Run full diagnostics
 diag:

@@ -26,9 +26,14 @@
 #include <thread>
 
 static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t reload_config = 0;
 
 void signal_handler(int sig) {
-    running = 0;
+    if (sig == SIGHUP) {
+        reload_config = 1;
+    } else {
+        running = 0;
+    }
 }
 
 // Device mapping structures
@@ -247,7 +252,7 @@ int discovery_mode(const Config& config) {
     std::vector<InputDevice> devices;
     
     // Open all configured devices
-    for (const auto& input_config : config.inputs) {
+    for (const auto& [role_str, input_config] : config.devices) {
         if (input_config.by_id.empty()) {
             std::cout << "Skipping " << input_config.role << " (not present)\n";
             continue;
@@ -345,7 +350,8 @@ int diagnostics_mode(const Config& config) {
     std::cout << "CONFIGURATION:\n";
     std::cout << "  uinput_name: " << config.uinput_name << "\n";
     std::cout << "  device_grab: " << (config.grab ? "enabled" : "disabled") << "\n";
-    std::cout << "  configured_inputs: " << config.inputs.size() << "\n";
+    std::cout << "  configured_devices: " << config.devices.size() << "\n";
+    std::cout << "  active_profile: " << config.active_profile << "\n";
     
     // Device detection report
     std::cout << "\nDEVICE DETECTION:\n";
@@ -353,12 +359,12 @@ int diagnostics_mode(const Config& config) {
     int required_devices = 0;
     int failed_required = 0;
     
-    for (const auto& input_config : config.inputs) {
+    for (const auto& [role_str, input_config] : config.devices) {
         if (!input_config.optional) {
             required_devices++;
         }
         
-        std::cout << "  " << input_config.role << ":\n";
+        std::cout << "  " << role_str << ":\n";
         std::cout << "    configured_path: " << input_config.by_id << "\n";
         std::cout << "    expected_vendor: " << input_config.vendor << "\n";
         std::cout << "    expected_product: " << input_config.product << "\n";
@@ -424,7 +430,7 @@ int diagnostics_mode(const Config& config) {
         close(fd);
     }
     
-    std::cout << "\n  Summary: " << detected_devices << "/" << config.inputs.size() << " devices detected";
+    std::cout << "\n  Summary: " << detected_devices << "/" << config.devices.size() << " devices detected";
     if (failed_required > 0) {
         std::cout << " (" << failed_required << " required devices missing)";
     }
@@ -434,8 +440,10 @@ int diagnostics_mode(const Config& config) {
     std::cout << "\nBINDINGS:\n";
     
     std::vector<Binding> bindings;
-    if (!config.bindings_keys.empty() || !config.bindings_abs.empty()) {
-        auto config_bindings = make_bindings_from_config(config.bindings_keys, config.bindings_abs);
+    auto active_keys = config.get_active_bindings_keys();
+    auto active_abs = config.get_active_bindings_abs();
+    if (!active_keys.empty() || !active_abs.empty()) {
+        auto config_bindings = make_bindings_from_config(active_keys, active_abs);
         std::vector<Binding> valid_config_bindings;
         for (const auto& binding : config_bindings) {
             if (validate_bindings({binding})) {
@@ -445,7 +453,7 @@ int diagnostics_mode(const Config& config) {
         
         // Create temporary devices for validation (without opening them)
         std::vector<InputDevice> temp_devices;
-        for (const auto& input_config : config.inputs) {
+        for (const auto& [role_str, input_config] : config.devices) {
             InputDevice device;
             device.role = input_config.role;
             device.by_id_path = input_config.by_id;
@@ -630,7 +638,7 @@ int diag_axes_mode(const Config& config) {
     // Open and validate all devices
     std::vector<InputDevice> input_devices;
     
-    for (const auto& input_config : config.inputs) {
+    for (const auto& [role_str, input_config] : config.devices) {
         if (input_config.by_id.empty()) {
             std::cout << "Skipping " << input_config.role << " (not configured)\n";
             continue;
@@ -690,8 +698,10 @@ int diag_axes_mode(const Config& config) {
     
     // Initialize binding resolver
     std::vector<Binding> bindings;
-    if (!config.bindings_keys.empty() || !config.bindings_abs.empty()) {
-        auto config_bindings = make_bindings_from_config(config.bindings_keys, config.bindings_abs);
+    auto active_keys = config.get_active_bindings_keys();
+    auto active_abs = config.get_active_bindings_abs();
+    if (!active_keys.empty() || !active_abs.empty()) {
+        auto config_bindings = make_bindings_from_config(active_keys, active_abs);
         
         std::vector<Binding> valid_config_bindings;
         for (const auto& binding : config_bindings) {
@@ -713,14 +723,14 @@ int diag_axes_mode(const Config& config) {
     BindingResolver resolver(bindings);
     
     // Apply calibrations from config
-    for (const auto& input_config : config.inputs) {
+    for (const auto& [role_str, axes] : config.calibrations) {
         Role role;
-        if (input_config.role == "stick") role = Role::Stick;
-        else if (input_config.role == "throttle") role = Role::Throttle;
-        else if (input_config.role == "rudder") role = Role::Rudder;
+        if (role_str == "stick") role = Role::Stick;
+        else if (role_str == "throttle") role = Role::Throttle;
+        else if (role_str == "rudder") role = Role::Rudder;
         else continue;
         
-        for (const auto& cal : input_config.calibrations) {
+        for (const auto& [axis_code, cal] : axes) {
             resolver.set_calibration(role, cal.src_code, cal);
         }
     }
@@ -999,10 +1009,10 @@ int main(int argc, char* argv[]) {
     sa.sa_handler = signal_handler;
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP, &sa, nullptr);
 
-    // Load config
-    std::string config_dir = std::string(getenv("HOME")) + "/.config/twcs-mapper";
-    std::string config_path = config_dir + "/config.json";
+    // Load config using new path resolution
+    std::string config_path = ConfigManager::get_config_path();
     
     auto config_opt = ConfigManager::load(config_path);
     if (!config_opt) {
@@ -1012,14 +1022,15 @@ int main(int argc, char* argv[]) {
     
     Config config = *config_opt;
     
-    std::cout << "Loaded inputs: " << config.inputs.size() << "\n";
-    for (const auto& in : config.inputs) {
-        std::cout << "  role=" << in.role
-                  << " optional=" << (in.optional ? "true" : "false")
-                  << " by_id=" << in.by_id
-                  << " vendor=" << in.vendor
-                  << " product=" << in.product << "\n";
+    std::cout << "Loaded devices: " << config.devices.size() << "\n";
+    for (const auto& [role, device] : config.devices) {
+        std::cout << "  role=" << role
+                  << " optional=" << (device.optional ? "true" : "false")
+                  << " by_id=" << device.by_id
+                  << " vendor=" << device.vendor
+                  << " product=" << device.product << "\n";
     }
+    std::cout << "Active profile: " << config.active_profile << "\n";
 
     // Check for discovery mode
     if (argc >= 2 && strcmp(argv[1], "--print-map") == 0) {
@@ -1039,7 +1050,7 @@ int main(int argc, char* argv[]) {
     // Open and validate all devices
     std::vector<InputDevice> input_devices;
     
-    for (const auto& input_config : config.inputs) {
+    for (const auto& [role_str, input_config] : config.devices) {
         if (input_config.by_id.empty()) {
             std::cout << "Skipping " << input_config.role << " (not configured)\n";
             if (!input_config.optional) {
@@ -1170,9 +1181,11 @@ int main(int argc, char* argv[]) {
     // Initialize binding resolver
     std::vector<Binding> bindings;
     
-    // Try to load bindings from config, fall back to defaults if none or invalid
-    if (!config.bindings_keys.empty() || !config.bindings_abs.empty()) {
-        auto config_bindings = make_bindings_from_config(config.bindings_keys, config.bindings_abs);
+    // Try to load bindings from active profile, fall back to defaults if none or invalid
+    auto active_keys = config.get_active_bindings_keys();
+    auto active_abs = config.get_active_bindings_abs();
+    if (!active_keys.empty() || !active_abs.empty()) {
+        auto config_bindings = make_bindings_from_config(active_keys, active_abs);
         
         // Validate config bindings and filter out invalid ones
         std::vector<Binding> valid_config_bindings;
@@ -1202,16 +1215,16 @@ int main(int argc, char* argv[]) {
     BindingResolver resolver(bindings);
     
     // Apply calibrations from config
-    for (const auto& input_config : config.inputs) {
+    for (const auto& [role_str, axes] : config.calibrations) {
         Role role;
-        if (input_config.role == "stick") role = Role::Stick;
-        else if (input_config.role == "throttle") role = Role::Throttle;
-        else if (input_config.role == "rudder") role = Role::Rudder;
+        if (role_str == "stick") role = Role::Stick;
+        else if (role_str == "throttle") role = Role::Throttle;
+        else if (role_str == "rudder") role = Role::Rudder;
         else continue;
         
-        for (const auto& cal : input_config.calibrations) {
+        for (const auto& [axis_code, cal] : axes) {
             resolver.set_calibration(role, cal.src_code, cal);
-            std::cout << "Loaded calibration for " << input_config.role << " axis " << cal.src_code 
+            std::cout << "Loaded calibration for " << role_str << " axis " << cal.src_code 
                      << " (range: " << cal.observed_min << "-" << cal.observed_max << ")\n";
         }
     }
@@ -1317,6 +1330,54 @@ int main(int argc, char* argv[]) {
             } else if (rc != LIBEVDEV_READ_STATUS_SUCCESS) {
                 // Read error - handle device disconnection
                 handle_device_error(*source_device);
+            }
+        }
+        
+        // Check for config reload signal
+        if (reload_config) {
+            reload_config = 0;
+            std::cout << "\n[SIGHUP] Reloading configuration...\n";
+            
+            auto new_config_opt = ConfigManager::load(config_path);
+            if (new_config_opt) {
+                config = *new_config_opt;
+                std::cout << "Config reloaded. Active profile: " << config.active_profile << "\n";
+                
+                // Reload bindings from new config
+                auto new_active_keys = config.get_active_bindings_keys();
+                auto new_active_abs = config.get_active_bindings_abs();
+                if (!new_active_keys.empty() || !new_active_abs.empty()) {
+                    auto new_bindings = make_bindings_from_config(new_active_keys, new_active_abs);
+                    
+                    std::vector<Binding> valid_bindings;
+                    for (const auto& binding : new_bindings) {
+                        if (validate_bindings({binding})) {
+                            valid_bindings.push_back(binding);
+                        }
+                    }
+                    
+                    if (!valid_bindings.empty()) {
+                        bindings = valid_bindings;
+                        validate_and_filter_bindings(bindings, input_devices);
+                        resolver = BindingResolver(bindings);
+                        std::cout << "Loaded " << bindings.size() << " bindings from new config\n";
+                        
+                        // Reload calibrations
+                        for (const auto& [role_str, axes] : config.calibrations) {
+                            Role role;
+                            if (role_str == "stick") role = Role::Stick;
+                            else if (role_str == "throttle") role = Role::Throttle;
+                            else if (role_str == "rudder") role = Role::Rudder;
+                            else continue;
+                            
+                            for (const auto& [axis_code, cal] : axes) {
+                                resolver.set_calibration(role, cal.src_code, cal);
+                            }
+                        }
+                    }
+                }
+            } else {
+                std::cerr << "Failed to reload config\n";
             }
         }
         

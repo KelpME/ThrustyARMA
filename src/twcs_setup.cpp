@@ -320,9 +320,9 @@ std::vector<DeviceInfo> detect_devices() {
 std::vector<DeviceInfo> build_devices_from_config_inputs(const Config& cfg) {
     std::vector<DeviceInfo> devices;
     
-    for (const auto& input_config : cfg.inputs) {
+    for (const auto& [role, input_config] : cfg.devices) {
         if (input_config.by_id.empty()) {
-            std::cout << "Skipping " << input_config.role << " (no by_id path configured)\n";
+            std::cout << "Skipping " << role << " (no by_id path configured)\n";
             continue;
         }
         
@@ -405,8 +405,8 @@ std::map<std::string, DeviceInfo> select_devices_per_role(const std::vector<Devi
     
     // Build per-role required flag from config
     std::map<std::string, bool> role_required;
-    for (const auto& input : cfg.inputs) {
-        role_required[input.role] = !input.optional;
+    for (const auto& [role, input] : cfg.devices) {
+        role_required[role] = !input.optional;
     }
     
     std::vector<std::string> roles_to_check = {"stick", "throttle", "rudder"};
@@ -1749,34 +1749,43 @@ void capture_buttons(CaptureState& state) {
 }
 
 bool write_config(const CaptureState& state, const Config& existing_config) {
-    std::string config_dir = std::string(getenv("HOME")) + "/.config/twcs-mapper";
-    std::string config_path = config_dir + "/config.json";
+    std::string config_path = ConfigManager::get_config_path();
     
     // Use existing config and only update what's necessary
     Config config = existing_config;
     
-    // Update inputs based on selected devices
-    config.inputs.clear();
+    // Update devices based on selected devices
+    config.devices.clear();
     for (const auto& device : state.devices) {
-        InputConfig input;
-        input.role = device.role;
-        input.by_id = device.by_id;
-        input.vendor = device.vendor;
-        input.product = device.product;
-        input.optional = (device.role != "stick"); // Stick is required, others optional
+        DeviceConfig dev_config;
+        dev_config.role = device.role;
+        dev_config.by_id = device.by_id;
+        dev_config.vendor = device.vendor;
+        dev_config.product = device.product;
+        dev_config.optional = (device.role != "stick"); // Stick is required, others optional
         
-        // Add calibrations for this device from captured axes
+        config.devices[device.role] = dev_config;
+        
+        // Add calibrations for this device from captured axes (global calibrations)
         for (const auto& axis : state.captured_axes) {
             if (axis.role == device.role) {
-                input.calibrations.push_back(axis.calibration);
+                config.set_calibration(device.role, axis.calibration.src_code, axis.calibration);
             }
         }
-        
-        config.inputs.push_back(input);
     }
     
-    // Update bindings
-    config.bindings_keys.clear();
+    // Ensure default profile exists
+    if (config.profiles.empty()) {
+        Profile default_profile;
+        default_profile.name = "Default";
+        default_profile.description = "Created by setup wizard";
+        config.profiles["default"] = default_profile;
+        config.active_profile = "default";
+    }
+    
+    // Update bindings in active profile
+    auto& active_profile = config.profiles[config.active_profile];
+    active_profile.bindings_keys.clear();
     for (size_t i = 0; i < state.captured_buttons.size() && i < VIRTUAL_BUTTONS.size(); i++) {
         const auto& [role, src] = state.captured_buttons[i];
         if (role.empty() || src < 0) {
@@ -1788,10 +1797,10 @@ bool write_config(const CaptureState& state, const Config& existing_config) {
         binding.src = src;
         binding.dst = VIRTUAL_BUTTONS[i];
 
-        config.bindings_keys.push_back(binding);
+        active_profile.bindings_keys.push_back(binding);
     }
     
-    config.bindings_abs.clear();
+    active_profile.bindings_abs.clear();
     for (const auto& axis : state.captured_axes) {
         BindingConfigAbs binding;
         binding.role = axis.role;
@@ -1801,7 +1810,7 @@ bool write_config(const CaptureState& state, const Config& existing_config) {
         binding.deadzone = axis.deadzone;
         binding.scale = axis.scale;
         
-        config.bindings_abs.push_back(binding);
+        active_profile.bindings_abs.push_back(binding);
     }
     
     // Save config
@@ -1927,7 +1936,7 @@ int main() {
     std::vector<DeviceInfo> all_devices;
     
     // Try config-driven device building first
-    if (!config.inputs.empty()) {
+    if (!config.devices.empty()) {
         std::cout << "\nPhase 0: Building devices from config...\n";
         all_devices = build_devices_from_config_inputs(config);
     }

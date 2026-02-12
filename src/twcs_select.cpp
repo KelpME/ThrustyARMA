@@ -84,12 +84,12 @@ std::vector<DeviceInfo> enumerate_devices() {
     return devices;
 }
 
-InputConfig detect_device(const std::vector<DeviceInfo>& devices, 
+DeviceConfig detect_device(const std::vector<DeviceInfo>& devices, 
                       const std::string& role, 
                       const std::string& vendor, 
                       const std::string& product, 
                       bool optional) {
-    InputConfig config;
+    DeviceConfig config;
     config.role = role;
     config.vendor = vendor;
     config.product = product;
@@ -131,24 +131,30 @@ int main() {
     std::cout << "=== Device Detection ===\n";
     
     // Stick (required)
-    config.inputs.push_back(detect_device(devices, "stick", "044f", "b10a", false));
+    config.devices["stick"] = detect_device(devices, "stick", "044f", "b10a", false);
     
     // Throttle (optional)
-    config.inputs.push_back(detect_device(devices, "throttle", "044f", "b687", true));
+    config.devices["throttle"] = detect_device(devices, "throttle", "044f", "b687", true);
     
     // Rudder (optional)
-    config.inputs.push_back(detect_device(devices, "rudder", "044f", "b679", true));
+    config.devices["rudder"] = detect_device(devices, "rudder", "044f", "b679", true);
+    
+    // Create default profile with empty bindings
+    Profile default_profile;
+    default_profile.name = "Default";
+    default_profile.description = "Default profile";
+    config.profiles["default"] = default_profile;
+    config.active_profile = "default";
     
     std::cout << "\n=== Configuration ===\n";
-    std::cout << "Detected " << config.inputs.size() << " input devices:\n";
-    for (const auto& input : config.inputs) {
-        std::cout << "  " << input.role << ": " 
-                  << (input.by_id.empty() ? "not present" : input.by_id) 
-                  << " (optional: " << (input.optional ? "yes" : "no") << ")\n";
+    std::cout << "Detected " << config.devices.size() << " input devices:\n";
+    for (const auto& [role, device] : config.devices) {
+        std::cout << "  " << role << ": " 
+                  << (device.by_id.empty() ? "not present" : device.by_id) 
+                  << " (optional: " << (device.optional ? "yes" : "no") << ")\n";
     }
     
-    std::string config_dir = std::string(getenv("HOME")) + "/.config/twcs-mapper";
-    std::string config_path = config_dir + "/config.json";
+    std::string config_path = ConfigManager::get_config_path();
     
     if (ConfigManager::save(config_path, config)) {
         std::cout << "\nConfiguration saved to: " << config_path << "\n";

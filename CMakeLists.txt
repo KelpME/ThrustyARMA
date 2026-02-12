@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(twcs_mapper VERSION 1.0.0 LANGUAGES CXX)
+project(twcs_mapper VERSION 0.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,6 +51,23 @@ target_include_directories(twcs_config PRIVATE ${EVDEV_INCLUDE_DIRS} ${NCURSES_I
 target_compile_options(twcs_config PRIVATE ${EVDEV_CFLAGS_OTHER} ${NCURSES_CFLAGS_OTHER})
 target_compile_definitions(twcs_config PRIVATE _GNU_SOURCE)
 
+# Create twcs_tui executable (comprehensive TUI)
+add_executable(twcs_tui
+    src/tui/main.cpp
+    src/tui/tui.cpp
+    src/tui/device_dashboard.cpp
+    src/tui/mappings_view.cpp
+    src/tui/live_monitor.cpp
+    src/tui/profile_manager.cpp
+    src/tui/calibration_wizard.cpp
+    src/bindings.cpp
+)
+
+target_link_libraries(twcs_tui config_lib ${EVDEV_LIBRARIES} ${NCURSES_LIBRARIES})
+target_include_directories(twcs_tui PRIVATE ${EVDEV_INCLUDE_DIRS} ${NCURSES_INCLUDE_DIRS} src)
+target_compile_options(twcs_tui PRIVATE ${EVDEV_CFLAGS_OTHER} ${NCURSES_CFLAGS_OTHER})
+target_compile_definitions(twcs_tui PRIVATE _GNU_SOURCE)
+
 # Create twcs_setup executable
 add_executable(twcs_setup
     src/twcs_setup.cpp
@@ -64,7 +81,7 @@ target_compile_definitions(twcs_setup PRIVATE _GNU_SOURCE)
 # Install targets
 include(GNUInstallDirs)
 
-install(TARGETS twcs_select twcs_mapper twcs_config twcs_setup
+install(TARGETS twcs_select twcs_mapper twcs_config twcs_tui twcs_setup
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 

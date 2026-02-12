@@ -41,6 +41,7 @@ install -m 755 bin/twcs_mapper ~/.local/bin/twcs_mapper
 install -m 755 bin/twcs_setup ~/.local/bin/twcs_setup
 install -m 755 bin/twcs_config ~/.local/bin/twcs_config
 install -m 755 bin/twcs_select ~/.local/bin/twcs_select
+install -m 755 bin/twcs_tui ~/.local/bin/twcs_tui
 
 echo "✓ Binaries installed"
 echo ""
@@ -80,5 +81,6 @@ echo ""
 echo "Next steps:"
 echo "  1. Run 'twcs_setup' to configure your devices"
 echo "  2. Run 'twcs_config' for advanced binding configuration"
-echo "  3. Run 'twcs_mapper' to start the mapper manually"
+echo "  3. Run 'twcs_tui' for the comprehensive TUI interface"
+echo "  4. Run 'twcs_mapper' to start the mapper manually"
 echo ""
