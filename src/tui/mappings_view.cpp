@@ -151,10 +151,6 @@ void MappingsView::draw() {
                 if (drow.alt_code == -1 && drow.virtual_kind == SrcKind::Abs && drow.source_count == 1) {
                     std::string info;
                     if (bd->invert) info += "Inverted";
-                    if (bd->deadzone > 0) {
-                        if (!info.empty()) info += ", ";
-                        info += "Deadzone: " + std::to_string(bd->deadzone);
-                    }
                     if (bd->scale != 1.0f) {
                         if (!info.empty()) info += ", ";
                         std::ostringstream ss;
@@ -807,7 +803,7 @@ void MappingsView::show_edit_binding_dialog() {
     int starty = (tui->get_screen_height() - h) / 2;
     int startx = (tui->get_screen_width() - w) / 2;
     
-    int field = 0; // 0=invert, 1=deadzone, 2=scale
+    int field = 0; // 0=invert, 1=scale
     
     while (true) {
         Window dialog(h, w, starty, startx, " Edit Axis Transform ");
@@ -818,32 +814,28 @@ void MappingsView::show_edit_binding_dialog() {
         
         int attr0 = (field == 0) ? COLOR_PAIR(CP_SELECTED) : 0;
         int attr1 = (field == 1) ? COLOR_PAIR(CP_SELECTED) : 0;
-        int attr2 = (field == 2) ? COLOR_PAIR(CP_SELECTED) : 0;
         
         dialog.print(5, 2, "Invert:   " + std::string(target->invert ? "YES" : "NO "), attr0);
-        dialog.print(6, 2, "Deadzone: " + std::to_string(target->deadzone), attr1);
         
         char scale_buf[32];
         snprintf(scale_buf, sizeof(scale_buf), "%.2f", target->scale);
-        dialog.print(7, 2, "Scale:    " + std::string(scale_buf), attr2);
+        dialog.print(6, 2, "Scale:    " + std::string(scale_buf), attr1);
         
-        dialog.print(9, 2, "[Up/Down] Select  [+/-] Adjust  [ESC] Done", A_DIM);
+        dialog.print(8, 2, "[Up/Down] Select  [+/-] Adjust  [ESC] Done", A_DIM);
         
         dialog.refresh();
         
         int ch = getch();
         if (ch == 27) break;
         if (ch == KEY_UP || ch == 'k') { if (field > 0) field--; }
-        if (ch == KEY_DOWN || ch == 'j') { if (field < 2) field++; }
+        if (ch == KEY_DOWN || ch == 'j') { if (field < 1) field++; }
         if (ch == '+' || ch == '=' || ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
             if (field == 0) { target->invert = !target->invert; tui->mark_modified(); }
-            if (field == 1) { target->deadzone += 100; tui->mark_modified(); }
-            if (field == 2) { target->scale += 0.1f; tui->mark_modified(); }
+            if (field == 1) { target->scale += 0.1f; tui->mark_modified(); }
         }
         if (ch == '-') {
             if (field == 0) { target->invert = !target->invert; tui->mark_modified(); }
-            if (field == 1) { target->deadzone = std::max(0, target->deadzone - 100); tui->mark_modified(); }
-            if (field == 2) { target->scale = std::max(0.1f, target->scale - 0.1f); tui->mark_modified(); }
+            if (field == 1) { target->scale = std::max(0.1f, target->scale - 0.1f); tui->mark_modified(); }
         }
     }
     

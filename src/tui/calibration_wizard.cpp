@@ -115,15 +115,17 @@ void CalibrationWizard::draw_device_selection(Window* main_win) {
     // Dynamic column layout
     int usable = width - 4;
     int col_dev = 2;
-    int col_ctrl = col_dev + std::max(30, usable * 40 / 100);
-    int col_cal = col_ctrl + std::max(18, usable * 25 / 100);
+    int col_ctrl = col_dev + std::max(28, usable * 35 / 100);
+    int col_dz = col_ctrl + std::max(16, usable * 20 / 100);
+    int col_cal = col_dz + std::max(12, usable * 15 / 100);
     
     main_win->print(3, 2, "Select a mapped axis to calibrate:", COLOR_PAIR(CP_HEADER));
     
     char hdr[256];
-    snprintf(hdr, sizeof(hdr), "%-*s%-*s%s",
+    snprintf(hdr, sizeof(hdr), "%-*s%-*s%-*s%s",
              col_ctrl - col_dev, "Device",
-             col_cal - col_ctrl, "Xbox Control",
+             col_dz - col_ctrl, "Xbox Control",
+             col_cal - col_dz, "Deadzone",
              "Status");
     main_win->print(5, 2, hdr, A_BOLD);
     main_win->print(6, 2, std::string(width - 4, '-'));
@@ -139,6 +141,10 @@ void CalibrationWizard::draw_device_selection(Window* main_win) {
     for (size_t i = 0; i < items.size() && row < height - 4; i++) {
         const auto& item = items[i];
         
+        // Look up current deadzone from calibration
+        auto cal = tui->get_config().get_calibration(item.role, item.src_axis);
+        std::string dz_str = cal.has_value() ? std::to_string(cal->deadzone_radius) : "-";
+        
         if (!item.online) {
             // Offline device — dim the whole row
             wattron(main_win->get(), A_DIM);
@@ -148,7 +154,8 @@ void CalibrationWizard::draw_device_selection(Window* main_win) {
             if (static_cast<int>(dev_label.length()) > dev_width)
                 dev_label = dev_label.substr(0, dev_width - 3) + "...";
             mvwprintw(main_win->get(), row, col_dev, "%-*s", col_ctrl - col_dev, dev_label.c_str());
-            mvwprintw(main_win->get(), row, col_ctrl, "%-*s", col_cal - col_ctrl, item.xbox_name.c_str());
+            mvwprintw(main_win->get(), row, col_ctrl, "%-*s", col_dz - col_ctrl, item.xbox_name.c_str());
+            mvwprintw(main_win->get(), row, col_dz, "%-*s", col_cal - col_dz, dz_str.c_str());
             
             wattroff(main_win->get(), A_DIM);
             
@@ -167,7 +174,10 @@ void CalibrationWizard::draw_device_selection(Window* main_win) {
             mvwprintw(main_win->get(), row, col_dev, "%-*s", col_ctrl - col_dev, dev_label.c_str());
             
             // Xbox control name
-            mvwprintw(main_win->get(), row, col_ctrl, "%-*s", col_cal - col_ctrl, item.xbox_name.c_str());
+            mvwprintw(main_win->get(), row, col_ctrl, "%-*s", col_dz - col_ctrl, item.xbox_name.c_str());
+            
+            // Deadzone value
+            mvwprintw(main_win->get(), row, col_dz, "%-*s", col_cal - col_dz, dz_str.c_str());
             
             if (attrs) wattroff(main_win->get(), attrs);
             
@@ -186,7 +196,7 @@ void CalibrationWizard::draw_device_selection(Window* main_win) {
         row++;
     }
     
-    main_win->print(row + 2, 2, "[ENTER] Start calibration  [ESC] Cancel");
+    main_win->print(row + 2, 2, "[ENTER] Calibrate  [+/-] Adjust deadzone  [ESC] Cancel");
 }
 
 void CalibrationWizard::draw_ready_center(Window* main_win) {
@@ -403,6 +413,31 @@ void CalibrationWizard::handle_select_device(int ch) {
         case KEY_ENTER:
             if (total_options > 0 && selected_item < total_options && items[selected_item].online) {
                 start_calibration();
+            }
+            break;
+        case '+':
+        case '=':
+            if (total_options > 0 && selected_item < total_options && items[selected_item].online) {
+                auto& item = items[selected_item];
+                auto cal = tui->get_config().get_calibration(item.role, item.src_axis);
+                if (cal.has_value()) {
+                    cal->deadzone_radius += 1;
+                    tui->get_config().set_calibration(item.role, item.src_axis, *cal);
+                    tui->mark_modified();
+                    needs_redraw = true;
+                }
+            }
+            break;
+        case '-':
+            if (total_options > 0 && selected_item < total_options && items[selected_item].online) {
+                auto& item = items[selected_item];
+                auto cal = tui->get_config().get_calibration(item.role, item.src_axis);
+                if (cal.has_value()) {
+                    cal->deadzone_radius = std::max(0, cal->deadzone_radius - 1);
+                    tui->get_config().set_calibration(item.role, item.src_axis, *cal);
+                    tui->mark_modified();
+                    needs_redraw = true;
+                }
             }
             break;
         case 27: // ESC

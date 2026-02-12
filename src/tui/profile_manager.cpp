@@ -1,4 +1,6 @@
 #include "profile_manager.hpp"
+#include <sys/stat.h>
+#include <ctime>
 
 ProfileManager::ProfileManager(TUI* parent) : View(parent, ViewType::PROFILES), 
                                scroll_offset(0), selected_idx(0), message_timer(0) {}
@@ -15,8 +17,20 @@ void ProfileManager::draw() {
     
     // Title
     main_win->print(1, 2, "Profile Manager", COLOR_PAIR(CP_HEADER) | A_BOLD);
-    main_win->print(2, 2, "Config: " + ConfigManager::get_config_path(), COLOR_PAIR(CP_DEFAULT) | A_DIM);
-    main_win->print(3, 2, "Active: " + config.active_profile, COLOR_PAIR(CP_SUCCESS));
+    std::string config_path = ConfigManager::get_config_path();
+    main_win->print(2, 2, "Config: " + config_path, COLOR_PAIR(CP_DEFAULT) | A_DIM);
+    
+    // Show last-saved date from config file mtime
+    struct stat st;
+    std::string saved_str = "never";
+    if (stat(config_path.c_str(), &st) == 0) {
+        char timebuf[64];
+        struct tm* tm_info = localtime(&st.st_mtime);
+        strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M", tm_info);
+        saved_str = timebuf;
+    }
+    main_win->print(3, 2, "Last saved: " + saved_str, COLOR_PAIR(CP_DEFAULT) | A_DIM);
+    main_win->print(4, 2, "Active: " + config.active_profile, COLOR_PAIR(CP_SUCCESS));
     
     // Dynamic column layout
     int usable = width - 4;
@@ -32,8 +46,8 @@ void ProfileManager::draw() {
     snprintf(hdr, sizeof(hdr), "  %-*s%-12s%s",
              col_bindings - col_name, "Profile Name",
              "Bindings", "Description");
-    main_win->print(5, 2, hdr);
-    main_win->print(6, 2, std::string(width - 4, '-'));
+    main_win->print(6, 2, hdr);
+    main_win->print(7, 2, std::string(width - 4, '-'));
     
     // Convert profiles map to vector for indexed access
     std::vector<std::pair<std::string, Profile>> profile_list;
@@ -42,7 +56,7 @@ void ProfileManager::draw() {
     }
     
     // Profile list
-    int row = 7;
+    int row = 8;
     int visible_items = height - 12;
     
     for (size_t i = scroll_offset; i < profile_list.size() && row < height - 4; i++) {
