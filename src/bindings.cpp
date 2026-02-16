@@ -43,6 +43,16 @@ int BindingResolver::apply_axis_transform(int value, const AxisTransform& xform,
         if (cal_it != role_it->second.end()) {
             const AxisCalibration& cal = cal_it->second;
             
+            // TEMP DEBUG: log rudder transform
+            if (role == Role::Rudder) {
+                static int dbg_count = 0;
+                if (dbg_count++ % 100 == 0) {
+                    fprintf(stderr, "[RUDDER DBG] input=%d src_code=%d cal: min=%d max=%d center=%d dz=%d xform: min_out=%d max_out=%d invert=%d\n",
+                            input_value, src_code, cal.observed_min, cal.observed_max, cal.center_value, cal.deadzone_radius,
+                            xform.min_out, xform.max_out, xform.invert);
+                }
+            }
+            
             // Determine axis type: Throttle is always unidirectional, Stick/Rudder are centered
             bool is_centered = (role == Role::Stick || role == Role::Rudder) && 
                                (cal.center_value > cal.observed_min + 10) &&
@@ -84,6 +94,10 @@ int BindingResolver::apply_axis_transform(int value, const AxisTransform& xform,
     }
     
     // No calibration data - pass through with simple scaling
+    if (role == Role::Rudder) {
+        fprintf(stderr, "[RUDDER FALLBACK] NO CALIBRATION FOUND! role=%d src_code=%d value=%d\n",
+                static_cast<int>(role), src_code, value);
+    }
     float ratio = value / 65535.0f;
     if (xform.invert) {
         ratio = 1.0f - ratio;
@@ -137,6 +151,13 @@ void BindingResolver::process_input(const PhysicalInput& input, int value) {
                 DEBUG_LOG("Button refcount: %d\n", refcount);
             } else {
                 int transformed_value = apply_axis_transform(value, binding.xform, input.role, input.code);
+                if (input.role == Role::Rudder) {
+                    static int pdbg = 0;
+                    if (pdbg++ % 50 == 0) {
+                        fprintf(stderr, "[RUDDER PROC] raw=%d code=%d -> transformed=%d dst_code=%d\n",
+                                value, input.code, transformed_value, binding.dst.code);
+                    }
+                }
                 axis_values[binding.dst][input.role] = transformed_value;
                 DEBUG_LOG("Axis value for role %d: %d\n", static_cast<int>(input.role), transformed_value);
             }

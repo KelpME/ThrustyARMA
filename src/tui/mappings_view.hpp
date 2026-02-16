@@ -38,6 +38,7 @@ public:
 private:
     std::string get_slot_name(int code, SrcKind kind);
     void show_add_binding_dialog();
+    std::shared_ptr<DeviceInfo> show_device_select_dialog();
     void show_add_axis_listen_dialog(int dst_code);
     void show_add_button_listen_dialog(int dst_code);
     void show_add_merged_listen_dialog(const DisplayRow& drow);

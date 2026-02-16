@@ -38,7 +38,7 @@ void signal_handler(int sig) {
 
 // Device mapping structures
 struct InputDevice {
-    std::string role;
+    std::vector<std::string> roles;
     int fd;
     struct libevdev* dev;
     std::string path;
@@ -50,6 +50,19 @@ struct InputDevice {
     int consecutive_read_failures;
     std::chrono::steady_clock::time_point last_reconnect_attempt;
     int reconnect_backoff_ms;
+    // Map from (kind, code) to role for event routing when multiple roles share one device
+    std::map<std::pair<SrcKind, uint16_t>, std::string> code_to_role;
+
+    bool has_role(const std::string& r) const {
+        for (const auto& role : roles) {
+            if (role == r) return true;
+        }
+        return false;
+    }
+
+    std::string primary_role() const {
+        return roles.empty() ? "unknown" : roles[0];
+    }
 };
 
 Role string_to_role(const std::string& role_str) {
@@ -136,7 +149,7 @@ bool reopen_device(InputDevice& device) {
     device.consecutive_read_failures = 0;
     device.reconnect_backoff_ms = 500; // Reset to initial backoff
     
-    std::cout << "Successfully reconnected " << device.role << ": " << real_path << "\n";
+    std::cout << "Successfully reconnected " << device.primary_role() << ": " << real_path << "\n";
     return true;
 }
 
@@ -146,7 +159,7 @@ void handle_device_error(InputDevice& device) {
     // Mark offline if we get specific errors or repeated failures
     if (errno == ENODEV || errno == EIO || device.consecutive_read_failures >= 3) {
         if (device.online) {
-            std::cout << device.role << " device disconnected (errno=" << errno 
+            std::cout << device.primary_role() << " device disconnected (errno=" << errno 
                       << ", failures=" << device.consecutive_read_failures << ")\n";
             device.online = false;
         }
@@ -203,9 +216,10 @@ void validate_and_filter_bindings(std::vector<Binding>& bindings, const std::vec
         
         // Find the source device for this binding
         const InputDevice* source_device = nullptr;
+        std::string binding_role_str = (it->src.role == Role::Stick ? "stick" : 
+                                       it->src.role == Role::Throttle ? "throttle" : "rudder");
         for (const auto& device : devices) {
-            if (device.role == (it->src.role == Role::Stick ? "stick" : 
-                               it->src.role == Role::Throttle ? "throttle" : "rudder")) {
+            if (device.has_role(binding_role_str)) {
                 source_device = &device;
                 break;
             }
@@ -221,7 +235,7 @@ void validate_and_filter_bindings(std::vector<Binding>& bindings, const std::vec
         } else {
             // Check if device supports the source code
             if (!device_supports_code(*source_device, it->src.kind, it->src.code)) {
-                auto missing_key = std::make_tuple(source_device->role, it->src.kind, it->src.code);
+                auto missing_key = std::make_tuple(source_device->primary_role(), it->src.kind, it->src.code);
                 
                 // Log warning once per missing code
                 if (logged_missing_codes.find(missing_key) == logged_missing_codes.end()) {
@@ -229,7 +243,7 @@ void validate_and_filter_bindings(std::vector<Binding>& bindings, const std::vec
                     const char* code_name = libevdev_event_code_get_name(
                         it->src.kind == SrcKind::Key ? EV_KEY : EV_ABS, it->src.code);
                     
-                    std::cout << "WARNING: " << source_device->role << " device does not support "
+                    std::cout << "WARNING: " << source_device->primary_role() << " device does not support "
                               << type_name << " " << (code_name ? code_name : "UNKNOWN")
                               << " (" << it->src.code << "). Skipping binding.\n";
                     
@@ -286,7 +300,7 @@ int discovery_mode(const Config& config) {
         }
         
         InputDevice device;
-        device.role = input_config.role;
+        device.roles.push_back(input_config.role);
         device.fd = fd;
         device.dev = dev;
         device.path = real_path;
@@ -455,7 +469,7 @@ int diagnostics_mode(const Config& config) {
         std::vector<InputDevice> temp_devices;
         for (const auto& [role_str, input_config] : config.devices) {
             InputDevice device;
-            device.role = input_config.role;
+            device.roles.push_back(input_config.role);
             device.by_id_path = input_config.by_id;
             device.vendor = input_config.vendor;
             device.product = input_config.product;
@@ -672,7 +686,7 @@ int diag_axes_mode(const Config& config) {
         }
         
         InputDevice device;
-        device.role = input_config.role;
+        device.roles.push_back(input_config.role);
         device.fd = fd;
         device.dev = dev;
         device.path = real_path;
@@ -685,12 +699,12 @@ int diag_axes_mode(const Config& config) {
         device.reconnect_backoff_ms = 500;
         device.last_reconnect_attempt = std::chrono::steady_clock::now();
         input_devices.push_back(device);
-        
+
         const char* device_name = libevdev_get_name(dev);
         std::cout << "Opened " << input_config.role << ": " << (device_name ? device_name : "UNKNOWN") << "\n";
         std::cout << "  Path: " << input_config.by_id << "\n";
     }
-    
+
     if (input_devices.empty()) {
         std::cerr << "No input devices available\n";
         return 1;
@@ -742,11 +756,10 @@ int diag_axes_mode(const Config& config) {
         if (binding.dst.kind == SrcKind::Abs) {
             // Find the device for this binding
             std::string device_name = "UNKNOWN";
+            std::string binding_role = (binding.src.role == Role::Stick) ? "stick" : 
+                                      (binding.src.role == Role::Throttle) ? "throttle" : "rudder";
             for (const auto& device : input_devices) {
-                std::string dev_role = device.role;
-                std::string binding_role = (binding.src.role == Role::Stick) ? "stick" : 
-                                          (binding.src.role == Role::Throttle) ? "throttle" : "rudder";
-                if (dev_role == binding_role) {
+                if (device.has_role(binding_role)) {
                     const char* name = libevdev_get_name(device.dev);
                     if (name) device_name = name;
                     break;
@@ -779,11 +792,10 @@ int diag_axes_mode(const Config& config) {
         if (binding.dst.kind == SrcKind::Key) {
             // Find the device for this binding
             std::string device_name = "UNKNOWN";
+            std::string binding_role = (binding.src.role == Role::Stick) ? "stick" : 
+                                      (binding.src.role == Role::Throttle) ? "throttle" : "rudder";
             for (const auto& device : input_devices) {
-                std::string dev_role = device.role;
-                std::string binding_role = (binding.src.role == Role::Stick) ? "stick" : 
-                                          (binding.src.role == Role::Throttle) ? "throttle" : "rudder";
-                if (dev_role == binding_role) {
+                if (device.has_role(binding_role)) {
                     const char* name = libevdev_get_name(device.dev);
                     if (name) device_name = name;
                     break;
@@ -864,27 +876,54 @@ int diag_axes_mode(const Config& config) {
             struct input_event ev;
             int rc;
             while ((rc = libevdev_next_event(source_device->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev)) == LIBEVDEV_READ_STATUS_SUCCESS) {
-                Role role = string_to_role(source_device->role);
-                
+                // Determine role from the binding since device can have multiple roles
+                std::string event_role_str;
+                Role event_role = Role::Stick;
+                SrcKind event_kind = SrcKind::Key;
+                uint16_t event_code = 0;
+
+                if (ev.type == EV_ABS) {
+                    event_kind = SrcKind::Abs;
+                    event_code = static_cast<uint16_t>(ev.code);
+                } else if (ev.type == EV_KEY) {
+                    event_kind = SrcKind::Key;
+                    event_code = static_cast<uint16_t>(ev.code);
+                }
+
+                // Find which role this event belongs to by checking bindings
+                for (const auto& binding : bindings) {
+                    std::string binding_role_str = (binding.src.role == Role::Stick) ? "stick" :
+                                                  (binding.src.role == Role::Throttle) ? "throttle" : "rudder";
+                    if (source_device->has_role(binding_role_str) &&
+                        binding.src.kind == event_kind &&
+                        binding.src.code == event_code) {
+                        event_role_str = binding_role_str;
+                        event_role = binding.src.role;
+                        break;
+                    }
+                }
+
+                // Skip events that don't match any binding for this device's roles
+                if (event_role_str.empty()) continue;
+
                 // Handle axis events
                 if (ev.type == EV_ABS) {
-                    PhysicalInput input{role, SrcKind::Abs, static_cast<uint16_t>(ev.code)};
-                    
+                    PhysicalInput input{event_role, SrcKind::Abs, static_cast<uint16_t>(ev.code)};
+
                     // Check if this input has a binding
                     for (const auto& binding : bindings) {
-                        if (binding.src.role == input.role && 
-                            binding.src.kind == input.kind && 
+                        if (binding.src.role == input.role &&
+                            binding.src.kind == input.kind &&
                             binding.src.code == input.code &&
                             binding.dst.kind == SrcKind::Abs) {
-                            
-                            auto print_key = std::make_pair(source_device->role, ev.code);
+
+                            auto print_key = std::make_pair(source_device->primary_role(), ev.code);
                             auto now = std::chrono::steady_clock::now();
-                            
+
                             if (now - last_print[print_key] >= print_interval) {
                                 // Apply transform to show output value
-                                Role role = string_to_role(source_device->role);
-                                int transformed = resolver.apply_axis_transform(ev.value, binding.xform, role, ev.code);
-                                
+                                int transformed = resolver.apply_axis_transform(ev.value, binding.xform, event_role, ev.code);
+
                                 const char* device_name = libevdev_get_name(source_device->dev);
                                 const char* src_name = libevdev_event_code_get_name(EV_ABS, ev.code);
                                 std::string dst_name;
@@ -893,13 +932,13 @@ int diag_axes_mode(const Config& config) {
                                 else if (binding.dst.code == ABS_X) dst_name = "Left Stick X (Anti-torque)";
                                 else if (binding.dst.code == ABS_Y) dst_name = "Left Stick Y (Collective)";
                                 else dst_name = "ABS_" + std::to_string(binding.dst.code);
-                                
-                                std::cout << "[" << (device_name ? device_name : source_device->role) << "] "
+
+                                std::cout << "[" << (device_name ? device_name : source_device->primary_role()) << "] "
                                          << (src_name ? src_name : "UNKNOWN")
                                          << " (raw=" << ev.value << ") -> "
                                          << dst_name << " (out=" << transformed << ")\n";
                                 std::cout.flush();
-                                
+
                                 last_print[print_key] = now;
                             }
                             break;
@@ -908,7 +947,7 @@ int diag_axes_mode(const Config& config) {
                 }
                 // Handle button events
                 else if (ev.type == EV_KEY) {
-                    PhysicalInput input{role, SrcKind::Key, static_cast<uint16_t>(ev.code)};
+                    PhysicalInput input{event_role, SrcKind::Key, static_cast<uint16_t>(ev.code)};
                     
                     const char* device_name = libevdev_get_name(source_device->dev);
                     const char* src_name = libevdev_event_code_get_name(EV_KEY, ev.code);
@@ -954,7 +993,7 @@ int diag_axes_mode(const Config& config) {
                     }
                     
                     // Display button press/release
-                    std::cout << "[" << (device_name ? device_name : source_device->role) << "] "
+                    std::cout << "[" << (device_name ? device_name : source_device->primary_role()) << "] "
                              << src_button;
                     
                     if (has_binding) {
@@ -1048,8 +1087,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Open and validate all devices
-    std::vector<InputDevice> input_devices;
-    
+    // First, group all roles by physical device path (to support multiple roles per device)
+    std::map<std::string, std::vector<std::pair<std::string, const DeviceConfig*>>> path_to_roles;
     for (const auto& [role_str, input_config] : config.devices) {
         if (input_config.by_id.empty()) {
             std::cout << "Skipping " << input_config.role << " (not configured)\n";
@@ -1059,68 +1098,91 @@ int main(int argc, char* argv[]) {
             }
             continue;
         }
-        
+        path_to_roles[input_config.by_id].push_back({input_config.role, &input_config});
+    }
+
+    // Now open each unique physical device once
+    std::vector<InputDevice> input_devices;
+    for (const auto& [by_id_path, role_configs] : path_to_roles) {
         char real_path[PATH_MAX];
-        if (realpath(input_config.by_id.c_str(), real_path) == nullptr) {
-            std::cerr << "Failed to resolve " << input_config.role << " path: " << input_config.by_id << "\n";
-            if (!input_config.optional) {
-                return 1;
+        if (realpath(by_id_path.c_str(), real_path) == nullptr) {
+            std::cerr << "Failed to resolve device path: " << by_id_path << "\n";
+            bool all_optional = true;
+            for (const auto& [role, cfg] : role_configs) {
+                if (!cfg->optional) all_optional = false;
             }
+            if (!all_optional) return 1;
             continue;
         }
-        
+
         int fd = open(real_path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) {
-            perror(("Failed to open " + input_config.role).c_str());
-            if (!input_config.optional) {
-                return 1;
+            perror(("Failed to open device: " + by_id_path).c_str());
+            bool all_optional = true;
+            for (const auto& [role, cfg] : role_configs) {
+                if (!cfg->optional) all_optional = false;
             }
+            if (!all_optional) return 1;
             continue;
         }
 
         struct libevdev* dev = nullptr;
         int rc = libevdev_new_from_fd(fd, &dev);
         if (rc < 0) {
-            perror(("Failed to init " + input_config.role).c_str());
+            perror(("Failed to init device: " + by_id_path).c_str());
             close(fd);
-            if (!input_config.optional) {
-                return 1;
+            bool all_optional = true;
+            for (const auto& [role, cfg] : role_configs) {
+                if (!cfg->optional) all_optional = false;
             }
+            if (!all_optional) return 1;
             continue;
         }
-        
-        if (!validate_device(real_path, input_config.vendor, input_config.product)) {
-            std::cerr << "Device validation failed for " << input_config.role << "\n";
+
+        // Use first role's config for validation (same physical device)
+        const auto* first_cfg = role_configs[0].second;
+        if (!validate_device(real_path, first_cfg->vendor, first_cfg->product)) {
+            std::cerr << "Device validation failed for: " << by_id_path << "\n";
             libevdev_free(dev);
             close(fd);
-            if (!input_config.optional) {
-                return 1;
+            bool all_optional = true;
+            for (const auto& [role, cfg] : role_configs) {
+                if (!cfg->optional) all_optional = false;
             }
+            if (!all_optional) return 1;
             continue;
         }
-        
+
         // Grab device if configured
         if (config.grab) {
             rc = ioctl(fd, EVIOCGRAB, 1);
             if (rc < 0) {
-                perror(("Failed to grab " + input_config.role).c_str());
-                // Continue anyway - this might not be fatal
+                perror(("Failed to grab device: " + by_id_path).c_str());
             } else {
-                std::cout << "Grabbed " << input_config.role << ": " << real_path << "\n";
+                std::cout << "Grabbed device: " << by_id_path << "\n";
             }
         } else {
-            std::cout << "Opened " << input_config.role << ": " << real_path << " (no grab)\n";
+            std::cout << "Opened device: " << by_id_path << " (no grab)\n";
         }
-        
+
         InputDevice device;
-        device.role = input_config.role;
+        for (const auto& [role, cfg] : role_configs) {
+            device.roles.push_back(role);
+        }
         device.fd = fd;
         device.dev = dev;
         device.path = real_path;
-        device.by_id_path = input_config.by_id;
-        device.vendor = input_config.vendor;
-        device.product = input_config.product;
-        device.optional = input_config.optional;
+        device.by_id_path = by_id_path;
+        device.vendor = first_cfg->vendor;
+        device.product = first_cfg->product;
+        // Device is optional only if all roles are optional
+        device.optional = true;
+        for (const auto& [role, cfg] : role_configs) {
+            if (!cfg->optional) {
+                device.optional = false;
+                break;
+            }
+        }
         device.online = true;
         device.consecutive_read_failures = 0;
         device.reconnect_backoff_ms = 500;
@@ -1211,7 +1273,19 @@ int main(int argc, char* argv[]) {
     
     // Validate source codes and filter out invalid bindings
     validate_and_filter_bindings(bindings, input_devices);
-    
+
+    // Build code_to_role mapping for each device (needed when multiple roles share one device)
+    for (auto& device : input_devices) {
+        for (const auto& binding : bindings) {
+            std::string binding_role_str = (binding.src.role == Role::Stick) ? "stick" :
+                                          (binding.src.role == Role::Throttle) ? "throttle" : "rudder";
+            if (device.has_role(binding_role_str)) {
+                auto key = std::make_pair(binding.src.kind, binding.src.code);
+                device.code_to_role[key] = binding_role_str;
+            }
+        }
+    }
+
     BindingResolver resolver(bindings);
     
     // Apply calibrations from config
@@ -1279,18 +1353,26 @@ int main(int argc, char* argv[]) {
                 
                 switch (ev.type) {
                     case EV_ABS: {
-                        // Pass raw values to binding resolver - it handles all conversions
-                        Role role = string_to_role(source_device->role);
-                        PhysicalInput input{role, SrcKind::Abs, static_cast<uint16_t>(ev.code)};
-                        resolver.process_input(input, ev.value);
+                        // Look up role from code_to_role mapping (supports multiple roles per device)
+                        auto key = std::make_pair(SrcKind::Abs, static_cast<uint16_t>(ev.code));
+                        auto it = source_device->code_to_role.find(key);
+                        if (it != source_device->code_to_role.end()) {
+                            Role role = string_to_role(it->second);
+                            PhysicalInput input{role, SrcKind::Abs, static_cast<uint16_t>(ev.code)};
+                            resolver.process_input(input, ev.value);
+                        }
                         break;
                     }
-                    
+
                     case EV_KEY: {
-                        // Process through binding resolver
-                        Role role = string_to_role(source_device->role);
-                        PhysicalInput input{role, SrcKind::Key, static_cast<uint16_t>(ev.code)};
-                        resolver.process_input(input, ev.value);
+                        // Look up role from code_to_role mapping (supports multiple roles per device)
+                        auto key = std::make_pair(SrcKind::Key, static_cast<uint16_t>(ev.code));
+                        auto it = source_device->code_to_role.find(key);
+                        if (it != source_device->code_to_role.end()) {
+                            Role role = string_to_role(it->second);
+                            PhysicalInput input{role, SrcKind::Key, static_cast<uint16_t>(ev.code)};
+                            resolver.process_input(input, ev.value);
+                        }
                         break;
                     }
                     

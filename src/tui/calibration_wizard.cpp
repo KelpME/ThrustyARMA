@@ -562,13 +562,13 @@ void CalibrationWizard::sample_axis_value() {
     // Find device and read axis
     auto& devices = tui->get_devices();
     for (const auto& dev : devices) {
-        if (dev->has_role(selected_role) && dev->online && dev->dev) {
-            const struct input_absinfo* absinfo = libevdev_get_abs_info(dev->dev, selected_axis);
-            if (absinfo) {
+        if (dev->has_role(selected_role) && dev->online && dev->fd >= 0) {
+            struct input_absinfo absinfo;
+            if (ioctl(dev->fd, EVIOCGABS(selected_axis), &absinfo) == 0) {
                 if (state == State::CENTER_SAMPLE) {
-                    center_samples.push_back(absinfo->value);
+                    center_samples.push_back(absinfo.value);
                 } else if (state == State::RANGE_SAMPLE) {
-                    range_samples.push_back(absinfo->value);
+                    range_samples.push_back(absinfo.value);
                 }
             }
             break;

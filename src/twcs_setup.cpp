@@ -205,7 +205,8 @@ std::string detect_device_role(const DeviceInfo& device) {
     if (device_name.find("TWCS") != std::string::npos) {
         return "throttle";
     }
-    if (device_name.find("T-Rudder") != std::string::npos) {
+    if (device_name.find("T-Rudder") != std::string::npos ||
+        device_name.find("T-Pedals") != std::string::npos) {
         return "rudder";
     }
     if (device_name.find("T.16000M") != std::string::npos) {
@@ -393,7 +394,8 @@ int get_smart_default_for_role(const std::vector<DeviceInfo>& devices, const std
         if (role == "throttle" && device_name.find("TWCS") != std::string::npos) {
             return i;
         }
-        if (role == "rudder" && device_name.find("T-Rudder") != std::string::npos) {
+        if (role == "rudder" && (device_name.find("T-Rudder") != std::string::npos ||
+                                     device_name.find("T-Pedals") != std::string::npos)) {
             return i;
         }
     }

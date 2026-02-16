@@ -56,6 +56,21 @@ void LiveMonitor::draw_axes_panel(Window* win, int start_col, int panel_width, i
             struct input_absinfo absinfo_buf;
             if (dev->fd >= 0 && ioctl(dev->fd, EVIOCGABS(axis), &absinfo_buf) == 0) {
                 int value = absinfo_buf.value;
+                
+                // Apply invert/scale from active bindings so monitor matches mapper output
+                for (const auto& role : dev->roles) {
+                    auto active_abs = tui->get_config().get_active_bindings_abs();
+                    for (const auto& ab : active_abs) {
+                        if (ab.role == role && ab.src == axis) {
+                            if (ab.invert) {
+                                value = absinfo_buf.maximum + absinfo_buf.minimum - value;
+                            }
+                            break;
+                        }
+                    }
+                    break; // use first role
+                }
+                
                 last_values[dev->roles_str() + "." + std::to_string(axis)] = value;
                 
                 const char* name = libevdev_event_code_get_name(EV_ABS, axis);

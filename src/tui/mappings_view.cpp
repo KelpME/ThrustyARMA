@@ -287,6 +287,77 @@ void MappingsView::show_add_binding_dialog() {
     }
 }
 
+std::shared_ptr<DeviceInfo> MappingsView::show_device_select_dialog() {
+    auto& devices = tui->get_devices();
+    
+    // Collect online devices with roles
+    std::vector<std::shared_ptr<DeviceInfo>> available_devices;
+    for (const auto& dev : devices) {
+        if (dev->online && dev->dev && !dev->roles.empty()) {
+            available_devices.push_back(dev);
+        }
+    }
+    
+    if (available_devices.empty()) {
+        int h = 7, w = 45;
+        int starty = (tui->get_screen_height() - h) / 2;
+        int startx = (tui->get_screen_width() - w) / 2;
+        Window dialog(h, w, starty, startx, " No Devices ");
+        dialog.print(2, 2, "No online devices with roles found.", COLOR_PAIR(CP_WARNING));
+        dialog.print(4, 2, "Press any key...", A_DIM);
+        dialog.refresh();
+        nodelay(stdscr, FALSE);
+        getch();
+        nodelay(stdscr, TRUE);
+        return nullptr;
+    }
+    
+    int selected = 0;
+    
+    while (true) {
+        int h = std::min(static_cast<int>(available_devices.size()) + 6, tui->get_screen_height() - 4);
+        int w = 60;
+        int starty = (tui->get_screen_height() - h) / 2;
+        int startx = (tui->get_screen_width() - w) / 2;
+        
+        Window dialog(h, w, starty, startx, " Select Device ");
+        dialog.print(1, 2, "Choose a device to map from:", A_DIM);
+        
+        int list_start = 3;
+        int max_display = h - list_start - 2;
+        int scroll = 0;
+        if (selected >= max_display) {
+            scroll = selected - max_display + 1;
+        }
+        
+        for (int i = 0; i < max_display && (i + scroll) < static_cast<int>(available_devices.size()); i++) {
+            int idx = i + scroll;
+            const auto& dev = available_devices[idx];
+            std::string line = get_role_icons(dev->roles) + " " + dev->name;
+            if (static_cast<int>(line.length()) > w - 6) {
+                line = line.substr(0, w - 9) + "...";
+            }
+            
+            int attrs = (idx == selected) ? (COLOR_PAIR(CP_SELECTED) | A_BOLD) : 0;
+            dialog.print(list_start + i, 2, line, attrs);
+        }
+        
+        dialog.print(h - 2, 2, "[Up/Down] Select  [Enter] Choose  [ESC] Cancel", A_DIM);
+        dialog.refresh();
+        
+        int ch = getch();
+        if (ch == 27) {
+            return nullptr;
+        } else if (ch == KEY_UP || ch == 'k') {
+            if (selected > 0) selected--;
+        } else if (ch == KEY_DOWN || ch == 'j') {
+            if (selected < static_cast<int>(available_devices.size()) - 1) selected++;
+        } else if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+            return available_devices[selected];
+        }
+    }
+}
+
 void MappingsView::show_add_axis_listen_dialog(int dst_code) {
     auto& config = tui->get_config();
     
@@ -301,9 +372,19 @@ void MappingsView::show_add_axis_listen_dialog(int dst_code) {
     if (mapper_was_running) {
         tui->scan_devices();
     }
-    auto& devices = tui->get_devices();
     
-    // Record baseline axis values so we can detect significant movement
+    // Select device first
+    auto selected_dev = show_device_select_dialog();
+    if (!selected_dev) {
+        // User cancelled device selection
+        if (mapper_was_running) {
+            start_mapper_service();
+        }
+        needs_redraw = true;
+        return;
+    }
+    
+    // Record baseline axis values for the selected device only
     struct AxisBaseline {
         std::shared_ptr<DeviceInfo> dev;
         int code;
@@ -312,19 +393,16 @@ void MappingsView::show_add_axis_listen_dialog(int dst_code) {
     };
     std::vector<AxisBaseline> baselines;
     
-    // Drain pending events and record current positions (only assigned devices)
-    for (const auto& dev : devices) {
-        if (!dev->online || !dev->dev || dev->roles.empty()) continue;
-        struct input_event ev;
-        while (libevdev_next_event(dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {}
-        for (int axis : dev->axes) {
-            int val = libevdev_get_event_value(dev->dev, EV_ABS, axis);
-            // Use 25% of axis range as threshold
-            const struct input_absinfo* info = libevdev_get_abs_info(dev->dev, axis);
-            int range = info ? (info->maximum - info->minimum) : 65535;
-            int thresh = std::max(range / 4, 50);
-            baselines.push_back({dev, axis, val, thresh});
-        }
+    // Drain pending events and record current positions
+    struct input_event ev;
+    while (libevdev_next_event(selected_dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {}
+    for (int axis : selected_dev->axes) {
+        int val = libevdev_get_event_value(selected_dev->dev, EV_ABS, axis);
+        // Use 25% of axis range as threshold
+        const struct input_absinfo* info = libevdev_get_abs_info(selected_dev->dev, axis);
+        int range = info ? (info->maximum - info->minimum) : 65535;
+        int thresh = std::max(range / 4, 50);
+        baselines.push_back({selected_dev, axis, val, thresh});
     }
     
     nodelay(stdscr, TRUE);
@@ -334,9 +412,12 @@ void MappingsView::show_add_axis_listen_dialog(int dst_code) {
     int captured_code = 0;
     std::string captured_name;
     
+    // Get role to use for this mapping
+    std::string selected_role = selected_dev->roles.empty() ? "" : selected_dev->roles[0];
+    
     while (!captured) {
         Window dialog(h, w, starty, startx, " Add to " + dst_name + " ");
-        dialog.print(2, 2, "Move an axis on any device...", COLOR_PAIR(CP_HEADER) | A_BOLD);
+        dialog.print(2, 2, "Move an axis on " + selected_dev->name + "...", COLOR_PAIR(CP_HEADER) | A_BOLD);
         dialog.print(4, 2, "The axis will be mapped to:", A_DIM);
         dialog.print(5, 4, dst_name, COLOR_PAIR(CP_SUCCESS) | A_BOLD);
         dialog.print(h - 2, 2, "[ESC] Cancel", A_DIM);
@@ -345,38 +426,35 @@ void MappingsView::show_add_axis_listen_dialog(int dst_code) {
         int ch = getch();
         if (ch == 27) {
             nodelay(stdscr, TRUE);
+            if (mapper_was_running) {
+                start_mapper_service();
+            }
             needs_redraw = true;
             return;
         }
         
-        // Poll assigned devices for axis movement
-        for (const auto& dev : devices) {
-            if (!dev->online || !dev->dev || dev->roles.empty()) continue;
-            struct input_event ev;
-            int rc = libevdev_next_event(dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
-            while (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
-                if (ev.type == EV_ABS) {
-                    // Check if this axis moved significantly from baseline
-                    for (const auto& bl : baselines) {
-                        if (bl.dev == dev && bl.code == ev.code) {
-                            int delta = abs(ev.value - bl.baseline);
-                            if (delta > bl.threshold) {
-                                captured_code = ev.code;
-                                const char* abs_name = libevdev_event_code_get_name(EV_ABS, ev.code);
-                                captured_name = abs_name ? abs_name : ("ABS_" + std::to_string(ev.code));
-                                if (!dev->roles.empty()) {
-                                    captured_role = dev->roles[0];
-                                }
-                                captured = true;
-                            }
-                            break;
+        // Poll only the selected device for axis movement
+        struct input_event ev;
+        int rc = libevdev_next_event(selected_dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        while (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
+            if (ev.type == EV_ABS) {
+                // Check if this axis moved significantly from baseline
+                for (const auto& bl : baselines) {
+                    if (bl.code == ev.code) {
+                        int delta = abs(ev.value - bl.baseline);
+                        if (delta > bl.threshold) {
+                            captured_code = ev.code;
+                            const char* abs_name = libevdev_event_code_get_name(EV_ABS, ev.code);
+                            captured_name = abs_name ? abs_name : ("ABS_" + std::to_string(ev.code));
+                            captured_role = selected_role;
+                            captured = true;
                         }
+                        break;
                     }
-                    if (captured) break;
                 }
-                rc = libevdev_next_event(dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+                if (captured) break;
             }
-            if (captured) break;
+            rc = libevdev_next_event(selected_dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
         }
         
         if (!captured) {
@@ -455,14 +533,21 @@ void MappingsView::show_add_button_listen_dialog(int dst_code) {
     if (mapper_was_running) {
         tui->scan_devices();
     }
-    auto& devices = tui->get_devices();
     
-    // Drain any pending events from assigned devices before listening
-    for (const auto& dev : devices) {
-        if (!dev->online || !dev->dev || dev->roles.empty()) continue;
-        struct input_event ev;
-        while (libevdev_next_event(dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {}
+    // Select device first
+    auto selected_dev = show_device_select_dialog();
+    if (!selected_dev) {
+        // User cancelled device selection
+        if (mapper_was_running) {
+            start_mapper_service();
+        }
+        needs_redraw = true;
+        return;
     }
+    
+    // Drain any pending events from selected device before listening
+    struct input_event ev;
+    while (libevdev_next_event(selected_dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == LIBEVDEV_READ_STATUS_SUCCESS) {}
     
     // Switch ncurses to non-blocking so we can poll devices
     nodelay(stdscr, TRUE);
@@ -472,9 +557,12 @@ void MappingsView::show_add_button_listen_dialog(int dst_code) {
     int captured_code = 0;
     std::string captured_name;
     
+    // Get role to use for this mapping
+    std::string selected_role = selected_dev->roles.empty() ? "" : selected_dev->roles[0];
+    
     while (!captured) {
         Window dialog(h, w, starty, startx, " Add to " + dst_name + " ");
-        dialog.print(2, 2, "Press a button on any device...", COLOR_PAIR(CP_HEADER) | A_BOLD);
+        dialog.print(2, 2, "Press a button on " + selected_dev->name + "...", COLOR_PAIR(CP_HEADER) | A_BOLD);
         dialog.print(4, 2, "The button press will be mapped to:", A_DIM);
         dialog.print(5, 4, dst_name, COLOR_PAIR(CP_SUCCESS) | A_BOLD);
         dialog.print(h - 2, 2, "[ESC] Cancel", A_DIM);
@@ -484,29 +572,25 @@ void MappingsView::show_add_button_listen_dialog(int dst_code) {
         int ch = getch();
         if (ch == 27) {
             nodelay(stdscr, TRUE);
+            if (mapper_was_running) {
+                start_mapper_service();
+            }
             needs_redraw = true;
             return;
         }
         
-        // Poll assigned devices for button press events
-        for (const auto& dev : devices) {
-            if (!dev->online || !dev->dev || dev->roles.empty()) continue;
-            struct input_event ev;
-            int rc = libevdev_next_event(dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
-            while (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
-                if (ev.type == EV_KEY && ev.value == 1) {
-                    captured_code = ev.code;
-                    const char* btn_name = libevdev_event_code_get_name(EV_KEY, ev.code);
-                    captured_name = btn_name ? btn_name : ("BTN_" + std::to_string(ev.code));
-                    if (!dev->roles.empty()) {
-                        captured_role = dev->roles[0];
-                    }
-                    captured = true;
-                    break;
-                }
-                rc = libevdev_next_event(dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        // Poll only the selected device for button press events
+        int rc = libevdev_next_event(selected_dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        while (rc == LIBEVDEV_READ_STATUS_SUCCESS) {
+            if (ev.type == EV_KEY && ev.value == 1) {
+                captured_code = ev.code;
+                const char* btn_name = libevdev_event_code_get_name(EV_KEY, ev.code);
+                captured_name = btn_name ? btn_name : ("BTN_" + std::to_string(ev.code));
+                captured_role = selected_role;
+                captured = true;
+                break;
             }
-            if (captured) break;
+            rc = libevdev_next_event(selected_dev->dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
         }
         
         if (!captured) {
